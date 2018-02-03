@@ -4,9 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/rand"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/bigtable"
+	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/pkg/errors"
 	"github.com/weaveworks/cortex/pkg/chunk"
@@ -19,6 +23,18 @@ const (
 	separator    = "\000"
 	maxRowReads  = 100
 )
+
+var (
+	readRowsTime = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "read_rows_duration_seconds",
+			Help: "Time taken to read rows from bigtable",
+		}, []string{"method"})
+)
+
+func init() {
+	prometheus.MustRegister(readRowsTime)
+}
 
 // Config for a StorageClient
 type Config struct {
@@ -110,26 +126,47 @@ func (s *storageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) 
 func (s *storageClient) QueryPages(ctx context.Context, query chunk.IndexQuery, callback func(result chunk.ReadBatch, lastPage bool) (shouldContinue bool)) error {
 	table := s.client.Open(query.TableName)
 
+	var useInfRange bool
+	var label string
+	if rand.Float64() > 0.5 {
+		useInfRange = true
+		label = "InfiniteRange"
+
+	} else {
+		useInfRange = false
+		label = "Range"
+	}
+
 	var rowRange bigtable.RowRange
 	if len(query.RangeValuePrefix) > 0 {
 		rowRange = bigtable.PrefixRange(query.HashValue + separator + string(query.RangeValuePrefix))
 	} else if len(query.RangeValueStart) > 0 {
-		rowRange = bigtable.InfiniteRange(query.HashValue + separator + string(query.RangeValueStart))
+		if useInfRange {
+			rowRange = bigtable.InfiniteRange(query.HashValue + separator + string(query.RangeValueStart))
+		} else {
+			rowRange = bigtable.NewRange(query.HashValue+separator+string(query.RangeValueStart), query.HashValue+separator+string('\xff'))
+		}
 	} else {
 		rowRange = bigtable.PrefixRange(query.HashValue + separator)
 	}
 
+	start := time.Now()
 	err := table.ReadRows(ctx, rowRange, func(r bigtable.Row) bool {
 		// Bigtable doesn't know when to stop, as we're reading "until the end of the
 		// row" in DynamoDB.  So we need to check the prefix of the row is still correct.
-		if !strings.HasPrefix(r.Key(), query.HashValue+separator) {
-			return false
+		if useInfRange {
+			if !strings.HasPrefix(r.Key(), query.HashValue+separator) {
+				return false
+			}
 		}
 		return callback(bigtableReadBatch(r), false)
 	}, bigtable.RowFilter(bigtable.FamilyFilter(columnFamily)))
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	readRowsTime.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	level.Error(util.WithContext(ctx, util.Logger)).Log("msg", "bigtable.ReadRows Timing", "useInfRange", useInfRange, "value", time.Since(start))
+
 	return nil
 }
 
