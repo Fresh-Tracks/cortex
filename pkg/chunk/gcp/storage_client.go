@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigtable"
-	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/pkg/errors"
@@ -27,8 +26,10 @@ const (
 var (
 	readRowsTime = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "read_rows_duration_seconds",
-			Help: "Time taken to read rows from bigtable",
+			Namespace: "cortex",
+			Subsystem: "querier",
+			Name:      "read_rows_duration_seconds",
+			Help:      "Time taken to read rows from bigtable",
 		}, []string{"method"})
 )
 
@@ -165,8 +166,6 @@ func (s *storageClient) QueryPages(ctx context.Context, query chunk.IndexQuery, 
 		return errors.WithStack(err)
 	}
 	readRowsTime.WithLabelValues(label).Observe(time.Since(start).Seconds())
-	level.Error(util.WithContext(ctx, util.Logger)).Log("msg", "bigtable.ReadRows Timing", "useInfRange", useInfRange, "value", time.Since(start))
-
 	return nil
 }
 
