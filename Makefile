@@ -68,7 +68,7 @@ ifeq ($(BUILD_IN_CONTAINER),true)
 
 $(EXES) $(PROTO_GOS) lint test shell: build-image/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
-	$(SUDO) time docker run $(RM) -ti \
+	$(SUDO) time docker run $(RM) -i \
 		-v $(shell pwd)/.pkg:/go/pkg \
 		-v $(shell pwd):/go/src/github.com/weaveworks/cortex \
 		$(IMAGE_PREFIX)build-image $@;
@@ -76,7 +76,7 @@ $(EXES) $(PROTO_GOS) lint test shell: build-image/$(UPTODATE)
 configs-integration-test: build-image/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
 	DB_CONTAINER="$$(docker run -d -e 'POSTGRES_DB=configs_test' postgres:9.6)"; \
-	$(SUDO) docker run $(RM) -ti \
+	$(SUDO) docker run $(RM) -i \
 		-v $(shell pwd)/.pkg:/go/pkg \
 		-v $(shell pwd):/go/src/github.com/weaveworks/cortex \
 		-v $(shell pwd)/cmd/configs/migrations:/migrations \
