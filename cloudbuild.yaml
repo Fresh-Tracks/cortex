@@ -1,5 +1,5 @@
 steps:
-- name: 'gcr.io/genuine-cat-188717/go-make'
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
   args: ['all']
   env: [
       'PROJECT_ROOT=github.com/weaveworks/cortex',
