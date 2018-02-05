@@ -6,6 +6,8 @@ steps:
 - name: 'gcr.io/cloud-builders/git'
   args: ['fetch', '--all']
 - name: 'gcr.io/cloud-builders/git'
+  args: ['checkout', '$BRANCH_NAME']
+- name: 'gcr.io/cloud-builders/git'
   args: ['merge', '--no-edit', '--allow-unrelated-histories', 'origin/grpc-streaming-open-tracing']
 - name: 'gcr.io/cloud-builders/git'
   args: ['merge', '--no-edit', '--allow-unrelated-histories', 'origin/bigtable-index-query-speedup']
