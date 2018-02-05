@@ -1,5 +1,7 @@
 steps:
 - name: 'gcr.io/cloud-builders/git'
+  args: ['fetch', '--all']
+- name: 'gcr.io/cloud-builders/git'
   args: ['merge', '--no-edit', 'origin/grpc-streaming-open-tracing']
 - name: 'gcr.io/cloud-builders/git'
   args: ['merge', '--no-edit', 'origin/bigtable-index-query-speedup']
