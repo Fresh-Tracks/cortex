@@ -1,5 +1,9 @@
 steps:
 - name: 'gcr.io/cloud-builders/git'
+  args: ['config', 'user.name', 'FreshTracks Cloud Builder']
+- name: 'gcr.io/cloud-builders/git'
+  args: ['config', 'user.email', 'info@freshtracks.io']
+- name: 'gcr.io/cloud-builders/git'
   args: ['fetch', '--all']
 - name: 'gcr.io/cloud-builders/git'
   args: ['merge', '--no-edit', '--allow-unrelated-histories', 'origin/grpc-streaming-open-tracing']
