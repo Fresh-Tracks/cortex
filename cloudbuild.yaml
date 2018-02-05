@@ -1,4 +1,8 @@
 steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['merge', '--no-edit', 'grpc-streaming-open-tracing']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['merge', '--no-edit', 'bigtable-index-query-speedup']
 - name: 'gcr.io/genuine-cat-188717/docker-with-make'
   args: ['all']
 - name: 'gcr.io/cloud-builders/docker'
