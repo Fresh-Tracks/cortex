@@ -1,6 +1,7 @@
 package client
 
 import (
+	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/mwitkow/go-grpc-middleware"
 	"github.com/opentracing/opentracing-go"
@@ -20,6 +21,7 @@ func MakeIngesterClient(addr string, withCompression bool) (IngesterClient, erro
 	opts := []grpc.DialOption{
 		grpc.WithInsecure(),
 		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
+			grpc_prometheus.UnaryClientInterceptor,
 			otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 			middleware.ClientUserHeaderInterceptor,
 		)),

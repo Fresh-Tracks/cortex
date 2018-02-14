@@ -17,6 +17,8 @@ import (
 	"github.com/weaveworks/cortex/pkg/ring"
 	"github.com/weaveworks/cortex/pkg/ruler"
 	"github.com/weaveworks/cortex/pkg/util"
+
+	_ "net/http/pprof"
 )
 
 func main() {
