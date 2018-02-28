@@ -198,6 +198,10 @@ func (s *storageClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) err
 }
 
 func (s *storageClient) GetChunks(ctx context.Context, input []chunk.Chunk) ([]chunk.Chunk, error) {
+	sp, ctx := ot.StartSpanFromContext(ctx, "GetChunks")
+	defer sp.Finish()
+	sp.LogFields(otlog.Int("chunks requested", len(input)))
+
 	chunks := map[string]map[string]chunk.Chunk{}
 	keys := map[string]bigtable.RowList{}
 	for _, c := range input {
@@ -259,16 +263,26 @@ func (s *storageClient) GetChunks(ctx context.Context, input []chunk.Chunk) ([]c
 	}
 
 	output := make([]chunk.Chunk, 0, len(input))
+	var err error
+
+results:
 	for i := 0; i < len(input); i++ {
 		select {
 		case c := <-outs:
 			output = append(output, c)
-		case err := <-errs:
-			return nil, err
+		case err = <-errs:
+			break results
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			err = ctx.Err()
+			break results
 		}
 	}
 
+	if err != nil {
+		sp.LogFields(otlog.String("error", err.Error()))
+		return nil, err
+	}
+
+	sp.LogFields(otlog.Int("chunks fetched", len(output)))
 	return output, nil
 }
