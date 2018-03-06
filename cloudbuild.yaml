@@ -1,0 +1,63 @@
+steps:
+- name: 'gcr.io/cloud-builders/git'
+  args: ['config', 'user.name', 'FreshTracks Cloud Builder']
+
+- name: 'gcr.io/cloud-builders/git'
+  args: ['config', 'user.email', 'info@freshtracks.io']
+
+- name: 'gcr.io/cloud-builders/git'
+  args: ['fetch', '--all']
+
+- name: 'gcr.io/cloud-builders/git'
+  args: ['checkout', '$BRANCH_NAME']
+
+  #- name: 'gcr.io/cloud-builders/git'
+  #  args: ['merge', '-X', 'recursive', '--no-edit', '--allow-unrelated-histories', 'origin/grpc-streaming-open-tracing']
+  #
+  #- name: 'gcr.io/cloud-builders/git'
+  #  args: ['merge', '-X', 'recursive', '--no-edit', '--allow-unrelated-histories', 'origin/bigtable-index-query-speedup']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/ingester/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-ingester', 'gcr.io/$PROJECT_ID/cortex-ingester:$BRANCH_NAME-$SHORT_SHA']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/configs/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-configs', 'gcr.io/$PROJECT_ID/cortex-configs:$BRANCH_NAME-$SHORT_SHA']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/table-manager/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-table-manager', 'gcr.io/$PROJECT_ID/cortex-table-manager:$BRANCH_NAME-$SHORT_SHA']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/querier/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-querier', 'gcr.io/$PROJECT_ID/cortex-querier:$BRANCH_NAME-$SHORT_SHA']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/ruler/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-ruler', 'gcr.io/$PROJECT_ID/cortex-ruler:$BRANCH_NAME-$SHORT_SHA']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/distributor/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-distributor', 'gcr.io/$PROJECT_ID/cortex-distributor:$BRANCH_NAME-$SHORT_SHA']
+
+- name: 'gcr.io/genuine-cat-188717/docker-with-make'
+  args: ['cmd/alertmanager/.uptodate', 'TTY=']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['tag', 'quay.io/weaveworks/cortex-alertmanager', 'gcr.io/$PROJECT_ID/cortex-alertmanager:$BRANCH_NAME-$SHORT_SHA']
+
+images: [
+  'gcr.io/$PROJECT_ID/cortex-configs:$BRANCH_NAME-$SHORT_SHA',
+  'gcr.io/$PROJECT_ID/cortex-table-manager:$BRANCH_NAME-$SHORT_SHA',
+  'gcr.io/$PROJECT_ID/cortex-querier:$BRANCH_NAME-$SHORT_SHA',
+  'gcr.io/$PROJECT_ID/cortex-ruler:$BRANCH_NAME-$SHORT_SHA',
+  'gcr.io/$PROJECT_ID/cortex-ingester:$BRANCH_NAME-$SHORT_SHA',
+  'gcr.io/$PROJECT_ID/cortex-distributor:$BRANCH_NAME-$SHORT_SHA',
+  'gcr.io/$PROJECT_ID/cortex-alertmanager:$BRANCH_NAME-$SHORT_SHA',
+  ]
