@@ -15,6 +15,8 @@ import (
 	gklog "github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/api"
+	v1_api "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
@@ -24,6 +26,7 @@ import (
 	"github.com/prometheus/prometheus/discovery/dns"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/notifier"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
@@ -77,7 +80,7 @@ func init() {
 
 // Config is the configuration for the recording rules server.
 type Config struct {
-	// This is used for template expansion in alerts; must be a valid URL
+	// This is used for template expansion in alerts; must be a valid URL.
 	ExternalURL util.URLValue
 
 	// How frequently to evaluate rules by default.
@@ -96,31 +99,36 @@ type Config struct {
 	NotificationQueueCapacity int
 	// HTTP timeout duration when sending notifications to the Alertmanager.
 	NotificationTimeout time.Duration
-	// Timeout for rule group evaluation, including sending result to ingester
+	// Timeout for rule group evaluation, including sending result to ingester.
 	GroupTimeout time.Duration
+
+	// Address of queriers to send queries to. If empty do queries in process.
+	QuerierURL string
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.ExternalURL.URL, _ = url.Parse("") // Must be non-nil
 	f.Var(&cfg.ExternalURL, "ruler.external.url", "URL of alerts return path.")
-	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 15*time.Second, "How frequently to evaluate rules")
-	f.IntVar(&cfg.NumWorkers, "ruler.num-workers", 1, "Number of rule evaluator worker routines in this process")
+	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 15*time.Second, "How frequently to evaluate rules.")
+	f.IntVar(&cfg.NumWorkers, "ruler.num-workers", 1, "Number of rule evaluator worker routines in this process.")
 	f.Var(&cfg.AlertmanagerURL, "ruler.alertmanager-url", "URL of the Alertmanager to send notifications to.")
 	f.BoolVar(&cfg.AlertmanagerDiscovery, "ruler.alertmanager-discovery", false, "Use DNS SRV records to discover alertmanager hosts.")
 	f.DurationVar(&cfg.AlertmanagerRefreshInterval, "ruler.alertmanager-refresh-interval", 1*time.Minute, "How long to wait between refreshing alertmanager hosts.")
 	f.IntVar(&cfg.NotificationQueueCapacity, "ruler.notification-queue-capacity", 10000, "Capacity of the queue for notifications to be sent to the Alertmanager.")
 	f.DurationVar(&cfg.NotificationTimeout, "ruler.notification-timeout", 10*time.Second, "HTTP timeout duration when sending notifications to the Alertmanager.")
-	f.DurationVar(&cfg.GroupTimeout, "ruler.group-timeout", 10*time.Second, "Timeout for rule group evaluation, including sending result to ingester")
+	f.DurationVar(&cfg.GroupTimeout, "ruler.group-timeout", 10*time.Second, "Timeout for rule group evaluation, including sending result to ingester.")
 	if flag.Lookup("promql.lookback-delta") == nil {
 		flag.DurationVar(&promql.LookbackDelta, "promql.lookback-delta", promql.LookbackDelta, "Time since the last sample after which a time series is considered stale and ignored by expression evaluations.")
 	}
+	f.StringVar(&cfg.QuerierURL, "ruler.querier-url", "", "URL to reach queriers at. If empty do queries in process instead")
 }
 
 // Ruler evaluates rules.
 type Ruler struct {
 	engine        *promql.Engine
 	queryable     storage.Queryable
+	queryFunc     rules.QueryFunc
 	pusher        Pusher
 	alertURL      *url.URL
 	notifierCfg   *config.Config
@@ -199,9 +207,12 @@ func NewRuler(cfg Config, engine *promql.Engine, queryable storage.Queryable, d 
 	if err != nil {
 		return nil, err
 	}
+	queryFunc := httpQueryFunc(cfg.QuerierURL)
+	if cfg.QuerierURL == "" {
+		queryFunc = rules.EngineQueryFunc(engine, queryable)
+	}
 	return &Ruler{
-		engine:        engine,
-		queryable:     queryable,
+		queryFunc:     queryFunc,
 		pusher:        d,
 		alertURL:      cfg.ExternalURL.URL,
 		notifierCfg:   ncfg,
@@ -274,6 +285,44 @@ func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
 	return promConfig, nil
 }
 
+func metricToLabels(m model.Metric) labels.Labels {
+	tmp := map[string]string{}
+	for k, v := range m {
+		tmp[string(k)] = string(v)
+	}
+	return labels.FromMap(tmp)
+}
+
+func httpQueryFunc(url string) rules.QueryFunc {
+	c, err := NewClient(api.Config{Address: url})
+	return func(ctx native_ctx.Context, q string, t time.Time) (promql.Vector, error) {
+		if err != nil {
+			return nil, err
+		}
+		a := v1_api.NewAPI(c)
+		v, err := a.Query(ctx, q, t)
+		if err != nil {
+			return nil, err
+		}
+		if v.Type() != model.ValVector {
+			return nil, fmt.Errorf("Expected vector response, got %s", v.Type())
+		}
+		vector := v.(model.Vector)
+		result := promql.Vector{}
+		for _, sample := range vector {
+			s := promql.Sample{
+				Point: promql.Point{
+					T: int64(sample.Timestamp),
+					V: float64(sample.Value),
+				},
+				Metric: metricToLabels(sample.Metric),
+			}
+			result = append(result, s)
+		}
+		return result, nil
+	}
+}
+
 func (r *Ruler) newGroup(userID string, groupName string, rls []rules.Rule) (*group, error) {
 	appendable := &appendableAppender{pusher: r.pusher}
 	notifier, err := r.getOrCreateNotifier(userID)
@@ -282,7 +331,7 @@ func (r *Ruler) newGroup(userID string, groupName string, rls []rules.Rule) (*gr
 	}
 	opts := &rules.ManagerOptions{
 		Appendable:  appendable,
-		QueryFunc:   rules.EngineQueryFunc(r.engine, r.queryable),
+		QueryFunc:   r.queryFunc,
 		Context:     context.Background(),
 		ExternalURL: r.alertURL,
 		NotifyFunc:  sendAlerts(notifier, r.alertURL.String()),
