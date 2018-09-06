@@ -6,7 +6,7 @@ PROJECT_DIR="${SCRIPT_DIR}/.."
 source ${SCRIPT_DIR}/func.sh
 
 function getCortexLiteImage() {
-  echo $(${DOCKER} images --filter=reference='quay.io/weaveworks/${KS_ENV}*:latest' --format="{{ .Repository }}:{{ .Tag }}" | sort | uniq)
+  echo $(${DOCKER} images --filter=reference='quay.io/weaveworks/cortex-lite*:latest' --format="{{ .Repository }}:{{ .Tag }}" | sort | uniq)
 }
 
 function buildLite() {
