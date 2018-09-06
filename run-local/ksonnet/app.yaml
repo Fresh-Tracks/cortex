@@ -5,7 +5,7 @@ environments:
       namespace: default
       server: https://192.168.99.100:8443
     k8sVersion: v1.9.4
-    path: cortex_default
+    path: cortex_lite
 kind: ksonnet.io/app
 name: cortex-lite
 registries:
