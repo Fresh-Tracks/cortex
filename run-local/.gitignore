@@ -1,0 +1,5 @@
+!**/ksonnet/environments/base.libsonnet
+!**/ksonnet/environments/cortex-lite
+**/ksonnet/environments/*
+**/ksonnet/app.yamle
+**/ksonnet/lib/v*
