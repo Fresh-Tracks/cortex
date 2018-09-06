@@ -1,3 +1,4 @@
 !**/ksonnet/environments/base.libsonnet
 !**/ksonnet/environments/cortex_lite
 **/ksonnet/lib/ksonnet-lib
+bigtable-emulator.log

@@ -20,7 +20,7 @@ echo "Checking for ${KS_ENV} minikube profile..."
 ${MK} status -p ${KS_ENV} > /dev/null 2>&1
 if [ $? -ne 0 ]; then
   echo "${KS_ENV} profile not found, creating ..."
-  ${MK} start --cpus 4 --memory 8192 --kubernetes-version v1.9.4 --profile ${KS_ENV} --log_dir ${SCRIPT_DIR}/logs
+  ${MK} start --cpus 4 --memory 8192 --kubernetes-version v1.10.0 --profile ${KS_ENV} --log_dir ${SCRIPT_DIR}/logs
 fi
 
 eval "$(${MK} docker-env -p ${KS_ENV})"
@@ -40,7 +40,12 @@ if [ -z "${CORTEX_LITE_IMG}" ]; then
   fi
 fi
 
-echo "Found ${KS_ENV} image in minikube docker: ${CORTEX_LITE_IMG}. Continuing..."
+echo "Found cortex-lite image in minikube docker: ${CORTEX_LITE_IMG}. Continuing..."
+
+echo "Starting Google Cloud Bigtable emulator..."
+nohup ${GC} beta emulators bigtable start > bigtable-emulator.log &
+
+sleep 1
 
 echo "Applying ksonnet bits to ${KS_ENV} environment..."
 pushd ksonnet > /dev/null

@@ -21,3 +21,10 @@ if [ -z "${KS}" ]; then
   echo "Sorry, you need to install ksonnet. Exiting."
   exit 1
 fi
+
+GC=$(which gcloud) > /dev/null 2>&1
+if [ -z "${KS}" ]; then
+  echo "Sorry, you need to install the Google Cloud SDK (gcloud). Exiting."
+  exit 1
+fi
+#gc beta emulators bigtable start
