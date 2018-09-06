@@ -1,10 +1,10 @@
 apiVersion: 0.2.0
 environments:
-  cortex_default:
+  cortex_lite:
     destination:
       namespace: default
       server: https://192.168.99.100:8443
-    k8sVersion: v1.9.4
+    k8sVersion: v1.10.0
     path: cortex_lite
 kind: ksonnet.io/app
 name: cortex-lite

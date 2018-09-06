@@ -9,5 +9,5 @@ echo "Deleting ksonnet bits from ${KS_ENV} environment..."
 pushd ksonnet > /dev/null
 kubectl config use-context ${KS_ENV}
 ${KS} delete --insecure-skip-tls-verify ${KS_ENV}
-git checkout app.yaml
+pkill -9 -f bigtable-emulator
 popd > /dev/null
