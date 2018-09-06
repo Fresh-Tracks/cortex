@@ -1,68 +1,98 @@
 package distributor
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"hash/fnv"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/go-kit/kit/log/level"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
-	"github.com/weaveworks/cortex/pkg/prom1/storage/metric"
 
 	billing "github.com/weaveworks/billing-client"
-	"github.com/weaveworks/common/instrument"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 	"github.com/weaveworks/cortex/pkg/ingester/client"
 	ingester_client "github.com/weaveworks/cortex/pkg/ingester/client"
+	"github.com/weaveworks/cortex/pkg/prom1/storage/metric"
 	"github.com/weaveworks/cortex/pkg/ring"
 	"github.com/weaveworks/cortex/pkg/util"
+	"github.com/weaveworks/cortex/pkg/util/extract"
+	"github.com/weaveworks/cortex/pkg/util/validation"
 )
 
-var errIngestionRateLimitExceeded = errors.New("ingestion rate limit exceeded")
+const (
+	rateLimited = "rate_limited"
+)
 
 var (
-	numClientsDesc = prometheus.NewDesc(
-		"cortex_distributor_ingester_clients",
-		"The current number of ingester clients.",
-		nil, nil,
-	)
-	labelNameBytes = []byte(model.MetricNameLabel)
+	queryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "cortex",
+		Name:      "distributor_query_duration_seconds",
+		Help:      "Time spent executing expression queries.",
+		Buckets:   []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
+	}, []string{"method", "status_code"})
+	receivedSamples = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_received_samples_total",
+		Help:      "The total number of received samples.",
+	}, []string{"user"})
+	sendDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "cortex",
+		Name:      "distributor_send_duration_seconds",
+		Help:      "Time spent sending a sample batch to multiple replicated ingesters.",
+		Buckets:   []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1},
+	}, []string{"method", "status_code"})
+	ingesterAppends = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_ingester_appends_total",
+		Help:      "The total number of batch appends sent to ingesters.",
+	}, []string{"ingester"})
+	ingesterAppendFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_ingester_append_failures_total",
+		Help:      "The total number of failed batch appends sent to ingesters.",
+	}, []string{"ingester"})
+	ingesterQueries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_ingester_queries_total",
+		Help:      "The total number of queries sent to ingesters.",
+	}, []string{"ingester"})
+	ingesterQueryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_ingester_query_failures_total",
+		Help:      "The total number of failed queries sent to ingesters.",
+	}, []string{"ingester"})
+	replicationFactor = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "cortex",
+		Name:      "distributor_replication_factor",
+		Help:      "The configured replication factor.",
+	})
 )
 
 // Distributor is a storage.SampleAppender and a client.Querier which
 // forwards appends and queries to individual ingesters.
 type Distributor struct {
-	cfg          Config
-	ring         ring.ReadRing
-	clientsMtx   sync.RWMutex
-	ingesterPool *ingester_client.IngesterPool
-	quit         chan struct{}
-	done         chan struct{}
-
+	cfg           Config
+	ring          ring.ReadRing
+	ingesterPool  *ingester_client.Pool
+	limits        *validation.Overrides
 	billingClient *billing.Client
 
 	// Per-user rate limiters.
 	ingestLimitersMtx sync.Mutex
 	ingestLimiters    map[string]*rate.Limiter
-
-	queryDuration          *prometheus.HistogramVec
-	receivedSamples        prometheus.Counter
-	sendDuration           *prometheus.HistogramVec
-	ingesterAppends        *prometheus.CounterVec
-	ingesterAppendFailures *prometheus.CounterVec
-	ingesterQueries        *prometheus.CounterVec
-	ingesterQueryFailures  *prometheus.CounterVec
 }
 
 // Config contains the configuration require to
@@ -71,33 +101,35 @@ type Config struct {
 	EnableBilling        bool
 	BillingConfig        billing.Config
 	IngesterClientConfig ingester_client.Config
+	PoolConfig           ingester_client.PoolConfig
+	limits               validation.Limits
 
-	RemoteTimeout        time.Duration
-	ClientCleanupPeriod  time.Duration
-	IngestionRateLimit   float64
-	IngestionBurstSize   int
-	HealthCheckIngesters bool
+	RemoteTimeout time.Duration
+
+	ShardByAllLabels bool
 
 	// for testing
-	ingesterClientFactory func(addr string, cfg ingester_client.Config) (client.IngesterClient, error)
+	ingesterClientFactory client.Factory
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	flag.BoolVar(&cfg.EnableBilling, "distributor.enable-billing", false, "Report number of ingested samples to billing system.")
 	cfg.BillingConfig.RegisterFlags(f)
 	cfg.IngesterClientConfig.RegisterFlags(f)
-	flag.DurationVar(&cfg.RemoteTimeout, "distributor.remote-timeout", 2*time.Second, "Timeout for downstream ingesters.")
-	flag.DurationVar(&cfg.ClientCleanupPeriod, "distributor.client-cleanup-period", 15*time.Second, "How frequently to clean up clients for ingesters that have gone away.")
-	flag.Float64Var(&cfg.IngestionRateLimit, "distributor.ingestion-rate-limit", 25000, "Per-user ingestion rate limit in samples per second.")
-	flag.IntVar(&cfg.IngestionBurstSize, "distributor.ingestion-burst-size", 50000, "Per-user allowed ingestion burst size (in number of samples).")
-	flag.BoolVar(&cfg.HealthCheckIngesters, "distributor.health-check-ingesters", false, "Run a health check on each ingester client during periodic cleanup.")
+	cfg.PoolConfig.RegisterFlags(f)
+	cfg.limits.RegisterFlags(f)
+
+	f.BoolVar(&cfg.EnableBilling, "distributor.enable-billing", false, "Report number of ingested samples to billing system.")
+	f.DurationVar(&cfg.RemoteTimeout, "distributor.remote-timeout", 2*time.Second, "Timeout for downstream ingesters.")
+	f.BoolVar(&cfg.ShardByAllLabels, "distributor.shard-by-all-labels", false, "Distribute samples based on all labels, as opposed to solely by user and metric name.")
 }
 
 // New constructs a new Distributor
 func New(cfg Config, ring ring.ReadRing) (*Distributor, error) {
 	if cfg.ingesterClientFactory == nil {
-		cfg.ingesterClientFactory = ingester_client.MakeIngesterClient
+		cfg.ingesterClientFactory = func(addr string) (grpc_health_v1.HealthClient, error) {
+			return ingester_client.MakeIngesterClient(addr, cfg.IngesterClientConfig)
+		}
 	}
 
 	var billingClient *billing.Client
@@ -109,119 +141,67 @@ func New(cfg Config, ring ring.ReadRing) (*Distributor, error) {
 		}
 	}
 
+	limits, err := validation.NewOverrides(cfg.limits)
+	if err != nil {
+		return nil, err
+	}
+
+	replicationFactor.Set(float64(ring.ReplicationFactor()))
+	cfg.PoolConfig.RemoteTimeout = cfg.RemoteTimeout
+
 	d := &Distributor{
 		cfg:            cfg,
 		ring:           ring,
-		ingesterPool:   ingester_client.NewIngesterPool(cfg.ingesterClientFactory, cfg.IngesterClientConfig, cfg.RemoteTimeout),
-		quit:           make(chan struct{}),
-		done:           make(chan struct{}),
+		ingesterPool:   ingester_client.NewPool(cfg.PoolConfig, ring, cfg.ingesterClientFactory, util.Logger),
 		billingClient:  billingClient,
+		limits:         limits,
 		ingestLimiters: map[string]*rate.Limiter{},
-		queryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "cortex",
-			Name:      "distributor_query_duration_seconds",
-			Help:      "Time spent executing expression queries.",
-			Buckets:   []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
-		}, []string{"method", "status_code"}),
-		receivedSamples: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "cortex",
-			Name:      "distributor_received_samples_total",
-			Help:      "The total number of received samples.",
-		}),
-		sendDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "cortex",
-			Name:      "distributor_send_duration_seconds",
-			Help:      "Time spent sending a sample batch to multiple replicated ingesters.",
-			Buckets:   []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1},
-		}, []string{"method", "status_code"}),
-		ingesterAppends: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "cortex",
-			Name:      "distributor_ingester_appends_total",
-			Help:      "The total number of batch appends sent to ingesters.",
-		}, []string{"ingester"}),
-		ingesterAppendFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "cortex",
-			Name:      "distributor_ingester_append_failures_total",
-			Help:      "The total number of failed batch appends sent to ingesters.",
-		}, []string{"ingester"}),
-		ingesterQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "cortex",
-			Name:      "distributor_ingester_queries_total",
-			Help:      "The total number of queries sent to ingesters.",
-		}, []string{"ingester"}),
-		ingesterQueryFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "cortex",
-			Name:      "distributor_ingester_query_failures_total",
-			Help:      "The total number of failed queries sent to ingesters.",
-		}, []string{"ingester"}),
 	}
-	go d.Run()
 	return d, nil
-}
-
-// Run starts the distributor's maintenance loop.
-func (d *Distributor) Run() {
-	cleanupClients := time.NewTicker(d.cfg.ClientCleanupPeriod)
-	for {
-		select {
-		case <-cleanupClients.C:
-			d.removeStaleIngesterClients()
-			if d.cfg.HealthCheckIngesters {
-				d.ingesterPool.CleanUnhealthy()
-			}
-		case <-d.quit:
-			close(d.done)
-			return
-		}
-	}
 }
 
 // Stop stops the distributor's maintenance loop.
 func (d *Distributor) Stop() {
-	close(d.quit)
-	<-d.done
+	d.limits.Stop()
+	d.ingesterPool.Stop()
 }
 
-func (d *Distributor) removeStaleIngesterClients() {
-	ingesters := map[string]struct{}{}
-	replicationSet, err := d.ring.GetAll()
+func (d *Distributor) tokenForLabels(userID string, labels []client.LabelPair) (uint32, error) {
+	if d.cfg.ShardByAllLabels {
+		return shardByAllLabels(userID, labels)
+	}
+
+	metricName, err := extract.MetricNameFromLabelPairs(labels)
 	if err != nil {
-		level.Error(util.Logger).Log("msg", "error removing stale ingester clients", "err", err)
-		return
+		return 0, err
 	}
-
-	for _, ing := range replicationSet.Ingesters {
-		ingesters[ing.Addr] = struct{}{}
-	}
-
-	for _, addr := range d.ingesterPool.RegisteredAddresses() {
-		if _, ok := ingesters[addr]; ok {
-			continue
-		}
-		level.Info(util.Logger).Log("msg", "removing stale ingester client", "addr", addr)
-		d.ingesterPool.RemoveClientFor(addr)
-	}
+	return shardByMetricName(userID, metricName), nil
 }
 
-func tokenForLabels(userID string, labels []client.LabelPair) (uint32, error) {
-	for _, label := range labels {
-		if label.Name.Equal(labelNameBytes) {
-			return tokenFor(userID, label.Value), nil
-		}
-	}
-	return 0, fmt.Errorf("No metric name label")
-}
-
-func tokenFor(userID string, name []byte) uint32 {
+func shardByMetricName(userID string, metricName []byte) uint32 {
 	h := fnv.New32()
 	h.Write([]byte(userID))
-	h.Write(name)
+	h.Write(metricName)
 	return h.Sum32()
+}
+
+func shardByAllLabels(userID string, labels []client.LabelPair) (uint32, error) {
+	h := fnv.New32()
+	h.Write([]byte(userID))
+	lastLabelName := []byte{}
+	for _, label := range labels {
+		if bytes.Compare(lastLabelName, label.Name) >= 0 {
+			return 0, fmt.Errorf("Labels not sorted")
+		}
+		h.Write(label.Name)
+		h.Write(label.Value)
+	}
+	return h.Sum32(), nil
 }
 
 type sampleTracker struct {
 	labels      []client.LabelPair
-	sample      client.Sample
+	samples     []client.Sample
 	minSuccess  int
 	maxFailures int
 	succeeded   int32
@@ -229,10 +209,10 @@ type sampleTracker struct {
 }
 
 type pushTracker struct {
-	samplesPending int32
-	samplesFailed  int32
-	done           chan struct{}
-	err            chan error
+	rpcsPending int32
+	rpcsFailed  int32
+	done        chan struct{}
+	err         chan error
 }
 
 // Push implements client.IngesterServer
@@ -242,33 +222,52 @@ func (d *Distributor) Push(ctx context.Context, req *client.WriteRequest) (*clie
 		return nil, err
 	}
 
-	// First we flatten out the request into a list of samples.
-	// We use the heuristic of 1 sample per TS to size the array.
-	// We also work out the hash value at the same time.
-	samples := make([]sampleTracker, 0, len(req.Timeseries))
+	var lastPartialErr error
+
+	// Build slice of sampleTrackers, one per timeseries.
+	sampleTrackers := make([]sampleTracker, 0, len(req.Timeseries))
 	keys := make([]uint32, 0, len(req.Timeseries))
+	numSamples := 0
 	for _, ts := range req.Timeseries {
-		key, err := tokenForLabels(userID, ts.Labels)
+		key, err := d.tokenForLabels(userID, ts.Labels)
 		if err != nil {
 			return nil, err
 		}
-		for _, s := range ts.Samples {
-			keys = append(keys, key)
-			samples = append(samples, sampleTracker{
-				labels: ts.Labels,
-				sample: s,
-			})
-		}
-	}
-	d.receivedSamples.Add(float64(len(samples)))
 
-	if len(samples) == 0 {
-		return &client.WriteResponse{}, nil
+		if err := d.limits.ValidateLabels(userID, ts.Labels); err != nil {
+			lastPartialErr = err
+			continue
+		}
+
+		metricName, _ := extract.MetricNameFromLabelPairs(ts.Labels)
+		samples := make([]client.Sample, 0, len(ts.Samples))
+		for _, s := range ts.Samples {
+			if err := d.limits.ValidateSample(userID, metricName, s); err != nil {
+				lastPartialErr = err
+				continue
+			}
+			samples = append(samples, s)
+		}
+
+		keys = append(keys, key)
+		sampleTrackers = append(sampleTrackers, sampleTracker{
+			labels:  ts.Labels,
+			samples: samples,
+		})
+		numSamples += len(ts.Samples)
+	}
+	receivedSamples.WithLabelValues(userID).Add(float64(numSamples))
+
+	if len(sampleTrackers) == 0 {
+		return &client.WriteResponse{}, lastPartialErr
 	}
 
 	limiter := d.getOrCreateIngestLimiter(userID)
-	if !limiter.AllowN(time.Now(), len(samples)) {
-		return nil, errIngestionRateLimitExceeded
+	if !limiter.AllowN(time.Now(), numSamples) {
+		// Return a 4xx here to have the client discard the data and not retry. If a client
+		// is sending too much data consistently we will unlikely ever catch up otherwise.
+		validation.DiscardedSamples.WithLabelValues(rateLimited, userID).Add(float64(numSamples))
+		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, "ingestion rate limit (%v) exceeded while adding %d samples", limiter.Limit(), numSamples)
 	}
 
 	replicationSets, err := d.ring.BatchGet(keys, ring.Write)
@@ -278,20 +277,20 @@ func (d *Distributor) Push(ctx context.Context, req *client.WriteRequest) (*clie
 
 	samplesByIngester := map[*ring.IngesterDesc][]*sampleTracker{}
 	for i, replicationSet := range replicationSets {
-		samples[i].minSuccess = len(replicationSet.Ingesters) - replicationSet.MaxErrors
-		samples[i].maxFailures = replicationSet.MaxErrors
+		sampleTrackers[i].minSuccess = len(replicationSet.Ingesters) - replicationSet.MaxErrors
+		sampleTrackers[i].maxFailures = replicationSet.MaxErrors
 		for _, ingester := range replicationSet.Ingesters {
-			samplesByIngester[ingester] = append(samplesByIngester[ingester], &samples[i])
+			samplesByIngester[ingester] = append(samplesByIngester[ingester], &sampleTrackers[i])
 		}
 	}
 
 	pushTracker := pushTracker{
-		samplesPending: int32(len(samples)),
-		done:           make(chan struct{}),
-		err:            make(chan error),
+		rpcsPending: int32(len(sampleTrackers)),
+		done:        make(chan struct{}),
+		err:         make(chan error),
 	}
-	for ingester, samples := range samplesByIngester {
-		go func(ingester *ring.IngesterDesc, samples []*sampleTracker) {
+	for ingester, sampleTrackers := range samplesByIngester {
+		go func(ingester *ring.IngesterDesc, sampleTrackers []*sampleTracker) {
 			// Use a background context to make sure all ingesters get samples even if we return early
 			localCtx, cancel := context.WithTimeout(context.Background(), d.cfg.RemoteTimeout)
 			defer cancel()
@@ -299,14 +298,14 @@ func (d *Distributor) Push(ctx context.Context, req *client.WriteRequest) (*clie
 			if sp := opentracing.SpanFromContext(ctx); sp != nil {
 				localCtx = opentracing.ContextWithSpan(localCtx, sp)
 			}
-			d.sendSamples(localCtx, ingester, samples, &pushTracker)
-		}(ingester, samples)
+			d.sendSamples(localCtx, ingester, sampleTrackers, &pushTracker)
+		}(ingester, sampleTrackers)
 	}
 	select {
 	case err := <-pushTracker.err:
 		return nil, err
 	case <-pushTracker.done:
-		return &client.WriteResponse{}, nil
+		return &client.WriteResponse{}, lastPartialErr
 	}
 }
 
@@ -318,7 +317,7 @@ func (d *Distributor) getOrCreateIngestLimiter(userID string) *rate.Limiter {
 		return limiter
 	}
 
-	limiter := rate.NewLimiter(rate.Limit(d.cfg.IngestionRateLimit), d.cfg.IngestionBurstSize)
+	limiter := rate.NewLimiter(rate.Limit(d.limits.IngestionRate(userID)), d.limits.IngestionBurstSize(userID))
 	d.ingestLimiters[userID] = limiter
 	return limiter
 }
@@ -340,14 +339,14 @@ func (d *Distributor) sendSamples(ctx context.Context, ingester *ring.IngesterDe
 			if atomic.AddInt32(&sampleTrackers[i].failed, 1) <= int32(sampleTrackers[i].maxFailures) {
 				continue
 			}
-			if atomic.AddInt32(&pushTracker.samplesFailed, 1) == 1 {
+			if atomic.AddInt32(&pushTracker.rpcsFailed, 1) == 1 {
 				pushTracker.err <- err
 			}
 		} else {
 			if atomic.AddInt32(&sampleTrackers[i].succeeded, 1) != int32(sampleTrackers[i].minSuccess) {
 				continue
 			}
-			if atomic.AddInt32(&pushTracker.samplesPending, -1) == 0 {
+			if atomic.AddInt32(&pushTracker.rpcsPending, -1) == 0 {
 				pushTracker.done <- struct{}{}
 			}
 		}
@@ -355,196 +354,66 @@ func (d *Distributor) sendSamples(ctx context.Context, ingester *ring.IngesterDe
 }
 
 func (d *Distributor) sendSamplesErr(ctx context.Context, ingester *ring.IngesterDesc, samples []*sampleTracker) error {
-	c, err := d.ingesterPool.GetClientFor(ingester.Addr)
+	h, err := d.ingesterPool.GetClientFor(ingester.Addr)
 	if err != nil {
 		return err
 	}
+	c := h.(ingester_client.IngesterClient)
 
-	req := &client.WriteRequest{
-		Timeseries: make([]client.TimeSeries, 0, len(samples)),
+	req := client.WriteRequest{
+		Timeseries: make([]client.PreallocTimeseries, len(samples)),
 	}
-	for _, s := range samples {
-		req.Timeseries = append(req.Timeseries, client.TimeSeries{
-			Labels:  s.labels,
-			Samples: []client.Sample{s.sample},
-		})
+	for i, s := range samples {
+		req.Timeseries[i].Labels = s.labels
+		req.Timeseries[i].Samples = s.samples
 	}
 
-	err = instrument.TimeRequestHistogram(ctx, "Distributor.sendSamples", d.sendDuration, func(ctx context.Context) error {
-		_, err := c.Push(ctx, req)
-		return err
-	})
-	d.ingesterAppends.WithLabelValues(ingester.Addr).Inc()
+	_, err = c.Push(ctx, &req)
+
+	ingesterAppends.WithLabelValues(ingester.Addr).Inc()
 	if err != nil {
-		d.ingesterAppendFailures.WithLabelValues(ingester.Addr).Inc()
+		ingesterAppendFailures.WithLabelValues(ingester.Addr).Inc()
 	}
 	return err
 }
 
-// Query implements Querier.
-func (d *Distributor) Query(ctx context.Context, from, to model.Time, matchers ...*labels.Matcher) (model.Matrix, error) {
-	var matrix model.Matrix
-	err := instrument.TimeRequestHistogram(ctx, "Distributor.Query", d.queryDuration, func(ctx context.Context) error {
-		userID, err := user.ExtractOrgID(ctx)
-		if err != nil {
-			return err
-		}
-
-		metricNameMatcher, _, ok := util.ExtractMetricNameMatcherFromMatchers(matchers)
-
-		req, err := ingester_client.ToQueryRequest(from, to, matchers)
-		if err != nil {
-			return err
-		}
-
-		// Get ingesters by metricName if one exists, otherwise get all ingesters
-		var replicationSet ring.ReplicationSet
-		if ok && metricNameMatcher.Type == labels.MatchEqual {
-			replicationSet, err = d.ring.Get(tokenFor(userID, []byte(metricNameMatcher.Value)), ring.Read)
-		} else {
-			replicationSet, err = d.ring.GetAll()
-		}
-		if err != nil {
-			return promql.ErrStorage(err)
-		}
-
-		matrix, err = d.queryIngesters(ctx, replicationSet, req)
-		return promql.ErrStorage(err)
-	})
-	return matrix, err
-}
-
-// Query implements Querier.
-func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.ReplicationSet, req *client.QueryRequest) (model.Matrix, error) {
-	// Fetch samples from multiple ingesters
-	errs := make(chan error, len(replicationSet.Ingesters))
-	results := make(chan model.Matrix, len(replicationSet.Ingesters))
-	for _, ing := range replicationSet.Ingesters {
-		go func(ing *ring.IngesterDesc) {
-			result, err := d.queryIngester(ctx, ing, req)
-			if err != nil {
-				errs <- err
-			} else {
-				results <- result
-			}
-		}(ing)
-	}
-
-	// Only wait for minSuccessful responses (or maxErrors), and accumulate the samples
-	// by fingerprint, merging them into any existing samples.
-	fpToSampleStream := map[model.Fingerprint]*model.SampleStream{}
-	minSuccess := len(replicationSet.Ingesters) - replicationSet.MaxErrors
-	var numErrs, numSuccess int
-	for numSuccess < minSuccess {
-		select {
-		case err := <-errs:
-			numErrs++
-			if numErrs > replicationSet.MaxErrors {
-				return nil, err
-			}
-
-		case result := <-results:
-			numSuccess++
-			for _, ss := range result {
-				fp := ss.Metric.Fingerprint()
-				mss, ok := fpToSampleStream[fp]
-				if !ok {
-					mss = &model.SampleStream{
-						Metric: ss.Metric,
-					}
-					fpToSampleStream[fp] = mss
-				}
-				mss.Values = util.MergeSampleSets(mss.Values, ss.Values)
-			}
-		}
-	}
-
-	result := model.Matrix{}
-	for _, ss := range fpToSampleStream {
-		result = append(result, ss)
-	}
-	return result, nil
-}
-
-func (d *Distributor) queryIngester(ctx context.Context, ing *ring.IngesterDesc, req *client.QueryRequest) (model.Matrix, error) {
-	client, err := d.ingesterPool.GetClientFor(ing.Addr)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := client.Query(ctx, req)
-	d.ingesterQueries.WithLabelValues(ing.Addr).Inc()
-	if err != nil {
-		d.ingesterQueryFailures.WithLabelValues(ing.Addr).Inc()
-		return nil, err
-	}
-
-	return ingester_client.FromQueryResponse(resp), nil
-}
-
 // forAllIngesters runs f, in parallel, for all ingesters
-func (d *Distributor) forAllIngesters(f func(client.IngesterClient) (interface{}, error)) ([]interface{}, error) {
+func (d *Distributor) forAllIngesters(ctx context.Context, f func(client.IngesterClient) (interface{}, error)) ([]interface{}, error) {
 	replicationSet, err := d.ring.GetAll()
 	if err != nil {
 		return nil, err
 	}
 
-	resps, errs := make(chan interface{}), make(chan error)
-	for _, ingester := range replicationSet.Ingesters {
-		go func(ingester *ring.IngesterDesc) {
-			client, err := d.ingesterPool.GetClientFor(ingester.Addr)
-			if err != nil {
-				errs <- err
-				return
-			}
-
-			resp, err := f(client)
-			if err != nil {
-				errs <- err
-			} else {
-				resps <- resp
-			}
-		}(ingester)
-	}
-
-	var lastErr error
-	result, numErrs := []interface{}{}, 0
-	for range replicationSet.Ingesters {
-		select {
-		case resp := <-resps:
-			result = append(result, resp)
-		case lastErr = <-errs:
-			numErrs++
+	return replicationSet.Do(ctx, func(ing *ring.IngesterDesc) (interface{}, error) {
+		client, err := d.ingesterPool.GetClientFor(ing.Addr)
+		if err != nil {
+			return nil, err
 		}
-	}
 
-	if numErrs > replicationSet.MaxErrors {
-		return nil, lastErr
-	}
-
-	return result, nil
+		return f(client.(ingester_client.IngesterClient))
+	})
 }
 
 // LabelValuesForLabelName returns all of the label values that are associated with a given label name.
-func (d *Distributor) LabelValuesForLabelName(ctx context.Context, labelName model.LabelName) (model.LabelValues, error) {
+func (d *Distributor) LabelValuesForLabelName(ctx context.Context, labelName model.LabelName) ([]string, error) {
 	req := &client.LabelValuesRequest{
 		LabelName: string(labelName),
 	}
-	resps, err := d.forAllIngesters(func(client client.IngesterClient) (interface{}, error) {
+	resps, err := d.forAllIngesters(ctx, func(client client.IngesterClient) (interface{}, error) {
 		return client.LabelValues(ctx, req)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	valueSet := map[model.LabelValue]struct{}{}
+	valueSet := map[string]struct{}{}
 	for _, resp := range resps {
 		for _, v := range resp.(*client.LabelValuesResponse).LabelValues {
-			valueSet[model.LabelValue(v)] = struct{}{}
+			valueSet[v] = struct{}{}
 		}
 	}
 
-	values := make(model.LabelValues, 0, len(valueSet))
+	values := make([]string, 0, len(valueSet))
 	for v := range valueSet {
 		values = append(values, v)
 	}
@@ -558,7 +427,7 @@ func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through
 		return nil, err
 	}
 
-	resps, err := d.forAllIngesters(func(client client.IngesterClient) (interface{}, error) {
+	resps, err := d.forAllIngesters(ctx, func(client client.IngesterClient) (interface{}, error) {
 		return client.MetricsForLabelMatchers(ctx, req)
 	})
 	if err != nil {
@@ -585,7 +454,7 @@ func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through
 // UserStats returns statistics about the current user.
 func (d *Distributor) UserStats(ctx context.Context) (*UserStats, error) {
 	req := &client.UserStatsRequest{}
-	resps, err := d.forAllIngesters(func(client client.IngesterClient) (interface{}, error) {
+	resps, err := d.forAllIngesters(ctx, func(client client.IngesterClient) (interface{}, error) {
 		return client.UserStats(ctx, req)
 	})
 	if err != nil {
@@ -594,8 +463,11 @@ func (d *Distributor) UserStats(ctx context.Context) (*UserStats, error) {
 
 	totalStats := &UserStats{}
 	for _, resp := range resps {
-		totalStats.IngestionRate += resp.(*client.UserStatsResponse).IngestionRate
-		totalStats.NumSeries += resp.(*client.UserStatsResponse).NumSeries
+		r := resp.(*client.UserStatsResponse)
+		totalStats.IngestionRate += r.IngestionRate
+		totalStats.APIIngestionRate += r.ApiIngestionRate
+		totalStats.RuleIngestionRate += r.RuleIngestionRate
+		totalStats.NumSeries += r.NumSeries
 	}
 
 	totalStats.IngestionRate /= float64(d.ring.ReplicationFactor())
@@ -628,13 +500,15 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 		if err != nil {
 			return nil, err
 		}
-		resp, err := client.AllUserStats(ctx, req)
+		resp, err := client.(ingester_client.IngesterClient).AllUserStats(ctx, req)
 		if err != nil {
 			return nil, err
 		}
 		for _, u := range resp.Stats {
 			s := perUserTotals[u.UserId]
 			s.IngestionRate += u.Data.IngestionRate
+			s.APIIngestionRate += u.Data.ApiIngestionRate
+			s.RuleIngestionRate += u.Data.RuleIngestionRate
 			s.NumSeries += u.Data.NumSeries
 			perUserTotals[u.UserId] = s
 		}
@@ -646,43 +520,13 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 		response = append(response, UserIDStats{
 			UserID: id,
 			UserStats: UserStats{
-				IngestionRate: stats.IngestionRate,
-				NumSeries:     stats.NumSeries,
+				IngestionRate:     stats.IngestionRate,
+				APIIngestionRate:  stats.APIIngestionRate,
+				RuleIngestionRate: stats.RuleIngestionRate,
+				NumSeries:         stats.NumSeries,
 			},
 		})
 	}
 
 	return response, nil
-}
-
-// Describe implements prometheus.Collector.
-func (d *Distributor) Describe(ch chan<- *prometheus.Desc) {
-	d.queryDuration.Describe(ch)
-	ch <- d.receivedSamples.Desc()
-	d.sendDuration.Describe(ch)
-	d.ring.Describe(ch)
-	ch <- numClientsDesc
-	d.ingesterAppends.Describe(ch)
-	d.ingesterAppendFailures.Describe(ch)
-	d.ingesterQueries.Describe(ch)
-	d.ingesterQueryFailures.Describe(ch)
-}
-
-// Collect implements prometheus.Collector.
-func (d *Distributor) Collect(ch chan<- prometheus.Metric) {
-	d.queryDuration.Collect(ch)
-	ch <- d.receivedSamples
-	d.sendDuration.Collect(ch)
-	d.ring.Collect(ch)
-	d.ingesterAppends.Collect(ch)
-	d.ingesterAppendFailures.Collect(ch)
-	d.ingesterQueries.Collect(ch)
-	d.ingesterQueryFailures.Collect(ch)
-	d.clientsMtx.RLock()
-	defer d.clientsMtx.RUnlock()
-	ch <- prometheus.MustNewConstMetric(
-		numClientsDesc,
-		prometheus.GaugeValue,
-		float64(d.ingesterPool.Count()),
-	)
 }

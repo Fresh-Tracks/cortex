@@ -2,9 +2,7 @@ package chunk
 
 import (
 	"bytes"
-	"crypto/sha1"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
@@ -16,24 +14,6 @@ import (
 	"github.com/weaveworks/common/test"
 	"github.com/weaveworks/cortex/pkg/util"
 )
-
-type mockSchema int
-
-func (mockSchema) GetWriteEntries(from, through model.Time, userID string, metricName model.LabelValue, labels model.Metric, chunkID string) ([]IndexEntry, error) {
-	return nil, nil
-}
-func (mockSchema) GetReadQueries(from, through model.Time, userID string) ([]IndexQuery, error) {
-	return nil, nil
-}
-func (mockSchema) GetReadQueriesForMetric(from, through model.Time, userID string, metricName model.LabelValue) ([]IndexQuery, error) {
-	return nil, nil
-}
-func (mockSchema) GetReadQueriesForMetricLabel(from, through model.Time, userID string, metricName model.LabelValue, labelName model.LabelName) ([]IndexQuery, error) {
-	return nil, nil
-}
-func (mockSchema) GetReadQueriesForMetricLabelValue(from, through model.Time, userID string, metricName model.LabelValue, labelName model.LabelName, labelValue model.LabelValue) ([]IndexQuery, error) {
-	return nil, nil
-}
 
 type ByHashRangeKey []IndexEntry
 
@@ -81,15 +61,6 @@ func TestSchemaHashKeys(t *testing.T) {
 			From:   util.NewDayValue(model.TimeFromUnix(5 * 24 * 60 * 60)),
 		},
 	}
-	compositeSchema := func(dailyBucketsFrom model.Time) Schema {
-		cfgCp := cfg
-		cfgCp.DailyBucketsFrom = util.NewDayValue(dailyBucketsFrom)
-		schema, err := newCompositeSchema(cfgCp)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return schema
-	}
 	hourlyBuckets := v1Schema(cfg)
 	dailyBuckets := v3Schema(cfg)
 	labelBuckets := v4Schema(cfg)
@@ -132,83 +103,6 @@ func TestSchemaHashKeys(t *testing.T) {
 			mergeResults(
 				mkResult(table, "userid:d%d:foo", 0, 3),
 				mkResult(table, "userid:d%d:foo:bar", 0, 3),
-			),
-		},
-
-		// Buckets are by hour until we reach the `dailyBucketsFrom`, after which they are by day.
-		{
-			compositeSchema(model.TimeFromUnix(0).Add(1 * 24 * time.Hour)),
-			0, (3 * 24 * 60 * 60) - 1, "foo",
-			mergeResults(
-				mkResult(table, "userid:%d:foo", 0, 1*24),
-				mkResult(table, "userid:d%d:foo", 1, 3),
-			),
-		},
-
-		// Only the day part of `dailyBucketsFrom` matters, not the time part.
-		{
-			compositeSchema(model.TimeFromUnix(0).Add(2*24*time.Hour) - 1),
-			0, (3 * 24 * 60 * 60) - 1, "foo",
-			mergeResults(
-				mkResult(table, "userid:%d:foo", 0, 1*24),
-				mkResult(table, "userid:d%d:foo", 1, 3),
-			),
-		},
-
-		// Moving dailyBucketsFrom to the previous day compared to the above makes 24 1-hour buckets disappear.
-		{
-			compositeSchema(model.TimeFromUnix(0).Add(1*24*time.Hour) - 1),
-			0, (3 * 24 * 60 * 60) - 1, "foo",
-			mkResult(table, "userid:d%d:foo", 0, 3),
-		},
-
-		// If `dailyBucketsFrom` is after the interval, everything will be bucketed by hour.
-		{
-			compositeSchema(model.TimeFromUnix(0).Add(99 * 24 * time.Hour)),
-			0, (2 * 24 * 60 * 60) - 1, "foo",
-			mkResult(table, "userid:%d:foo", 0, 2*24),
-		},
-
-		// Should only return daily buckets when dailyBucketsFrom is before the interval.
-		{
-			compositeSchema(model.TimeFromUnix(0)),
-			1 * 24 * 60 * 60, (3 * 24 * 60 * 60) - 1, "foo",
-			mkResult(table, "userid:d%d:foo", 1, 3),
-		},
-
-		// Basic weekly- ables.
-		{
-			compositeSchema(model.TimeFromUnix(0)),
-			5 * 24 * 60 * 60, (10 * 24 * 60 * 60) - 1, "foo",
-			mergeResults(
-				mkResult(periodicPrefix+"2", "userid:d%d:foo", 5, 6),
-				mkResult(periodicPrefix+"3", "userid:d%d:foo", 6, 8),
-				mkResult(periodicPrefix+"4", "userid:d%d:foo", 8, 10),
-			),
-		},
-
-		// Daily buckets + weekly tables.
-		{
-			compositeSchema(model.TimeFromUnix(0)),
-			0, (10 * 24 * 60 * 60) - 1, "foo",
-			mergeResults(
-				mkResult(table, "userid:d%d:foo", 0, 5),
-				mkResult(periodicPrefix+"2", "userid:d%d:foo", 5, 6),
-				mkResult(periodicPrefix+"3", "userid:d%d:foo", 6, 8),
-				mkResult(periodicPrefix+"4", "userid:d%d:foo", 8, 10),
-			),
-		},
-
-		// Houly Buckets, then daily buckets, then weekly tables.
-		{
-			compositeSchema(model.TimeFromUnix(2 * 24 * 60 * 60)),
-			0, (10 * 24 * 60 * 60) - 1, "foo",
-			mergeResults(
-				mkResult(table, "userid:%d:foo", 0, 2*24),
-				mkResult(table, "userid:d%d:foo", 2, 5),
-				mkResult(periodicPrefix+"2", "userid:d%d:foo", 5, 6),
-				mkResult(periodicPrefix+"3", "userid:d%d:foo", 6, 8),
-				mkResult(periodicPrefix+"4", "userid:d%d:foo", 8, 10),
 			),
 		},
 	} {
@@ -299,19 +193,12 @@ func TestSchemaRangeKey(t *testing.T) {
 		labelBuckets  = v4Schema(cfg)
 		tsRangeKeys   = v5Schema(cfg)
 		v6RangeKeys   = v6Schema(cfg)
-		v7RangeKeys   = v7Schema(cfg)
-		v8RangeKeys   = v8Schema(cfg)
 		metric        = model.Metric{
 			model.MetricNameLabel: metricName,
 			"bar": "bary",
 			"baz": "bazy",
 		}
-		fooSha1Hash = sha1.Sum([]byte("foo"))
 	)
-
-	seriesID := metricSeriesID(metric)
-	metricBytes, err := json.Marshal(metric)
-	require.NoError(t, err)
 
 	mkEntries := func(hashKey string, callback func(labelName model.LabelName, labelValue model.LabelValue) ([]byte, []byte)) []IndexEntry {
 		result := []IndexEntry{}
@@ -416,62 +303,6 @@ func TestSchemaRangeKey(t *testing.T) {
 				},
 			},
 		},
-		{
-			v7RangeKeys,
-			[]IndexEntry{
-				{
-					TableName:  table,
-					HashValue:  "userid:d0",
-					RangeValue: append(encodeBase64Bytes(fooSha1Hash[:]), []byte("\x00\x00\x006\x00")...),
-					Value:      []byte("foo"),
-				},
-				{
-					TableName:  table,
-					HashValue:  "userid:d0:foo",
-					RangeValue: []byte("0036ee7f\x00\x00chunkID\x003\x00"),
-				},
-				{
-					TableName:  table,
-					HashValue:  "userid:d0:foo:bar",
-					RangeValue: []byte("0036ee7f\x00\x00chunkID\x005\x00"),
-					Value:      []byte("bary"),
-				},
-				{
-					TableName:  table,
-					HashValue:  "userid:d0:foo:baz",
-					RangeValue: []byte("0036ee7f\x00\x00chunkID\x005\x00"),
-					Value:      []byte("bazy"),
-				},
-			},
-		},
-		{
-			v8RangeKeys,
-			[]IndexEntry{
-				{
-					TableName:  table,
-					HashValue:  "userid:d0",
-					RangeValue: append([]byte(seriesID), []byte("\x00\x00\x007\x00")...),
-					Value:      metricBytes,
-				},
-				{
-					TableName:  table,
-					HashValue:  "userid:d0:foo",
-					RangeValue: []byte("0036ee7f\x00\x00chunkID\x003\x00"),
-				},
-				{
-					TableName:  table,
-					HashValue:  "userid:d0:foo:bar",
-					RangeValue: []byte("0036ee7f\x00\x00chunkID\x005\x00"),
-					Value:      []byte("bary"),
-				},
-				{
-					TableName:  table,
-					HashValue:  "userid:d0:foo:baz",
-					RangeValue: []byte("0036ee7f\x00\x00chunkID\x005\x00"),
-					Value:      []byte("bazy"),
-				},
-			},
-		},
 	} {
 		t.Run(fmt.Sprintf("TestSchameRangeKey[%d]", i), func(t *testing.T) {
 			have, err := tc.Schema.GetWriteEntries(
@@ -498,7 +329,7 @@ func TestSchemaRangeKey(t *testing.T) {
 					_, err := parseMetricNameRangeValue(entry.RangeValue, entry.Value)
 					require.NoError(t, err)
 				case ChunkTimeRangeValue:
-					_, _, _, err := parseChunkTimeRangeValue(entry.RangeValue, entry.Value)
+					_, _, _, _, err := parseChunkTimeRangeValue(entry.RangeValue, entry.Value)
 					require.NoError(t, err)
 				case SeriesRangeValue:
 					_, err := parseSeriesRangeValue(entry.RangeValue, entry.Value)

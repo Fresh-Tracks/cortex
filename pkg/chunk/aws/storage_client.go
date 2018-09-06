@@ -45,6 +45,7 @@ const (
 	// See http://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits.html.
 	dynamoDBMaxWriteBatchSize = 25
 	dynamoDBMaxReadBatchSize  = 100
+	validationException       = "ValidationException"
 )
 
 var (
@@ -66,6 +67,11 @@ var (
 		Namespace: "cortex",
 		Name:      "dynamo_failures_total",
 		Help:      "The total number of errors while storing chunks to the chunk store.",
+	}, []string{tableNameLabel, errorReasonLabel, "operation"})
+	dynamoDroppedRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "dynamo_dropped_requests_total",
+		Help:      "The total number of requests which were dropped due to errors encountered from dynamo.",
 	}, []string{tableNameLabel, errorReasonLabel, "operation"})
 	dynamoQueryPagesCount = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "cortex",
@@ -96,6 +102,7 @@ func init() {
 	prometheus.MustRegister(dynamoQueryPagesCount)
 	prometheus.MustRegister(dynamoQueryRetryCount)
 	prometheus.MustRegister(s3RequestDuration)
+	prometheus.MustRegister(dynamoDroppedRequests)
 }
 
 // DynamoDBConfig specifies config for a DynamoDB database.
@@ -103,6 +110,7 @@ type DynamoDBConfig struct {
 	DynamoDB               util.URLValue
 	APILimit               float64
 	ApplicationAutoScaling util.URLValue
+	Metrics                MetricsAutoScalingConfig
 	ChunkGangSize          int
 	ChunkGetMaxParallelism int
 	backoffConfig          util.BackoffConfig
@@ -119,6 +127,7 @@ func (cfg *DynamoDBConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.backoffConfig.MinBackoff, "dynamodb.min-backoff", 100*time.Millisecond, "Minimum backoff time")
 	f.DurationVar(&cfg.backoffConfig.MaxBackoff, "dynamodb.max-backoff", 50*time.Second, "Maximum backoff time")
 	f.IntVar(&cfg.backoffConfig.MaxRetries, "dynamodb.max-retries", 20, "Maximum number of times to retry an operation")
+	cfg.Metrics.RegisterFlags(f)
 }
 
 // StorageConfig specifies config for storing data on AWS.
@@ -247,6 +256,16 @@ func (a storageClient) BatchWrite(ctx context.Context, input chunk.WriteBatch) e
 				logRetry(ctx, requests)
 				unprocessed.TakeReqs(requests, -1)
 				backoff.Wait()
+				continue
+			} else if ok && awsErr.Code() == validationException {
+				// this write will never work, so the only option is to drop the offending items and continue.
+				level.Warn(util.Logger).Log("Data lost while flushing to Dynamo: %v", awsErr)
+				level.Debug(util.Logger).Log("Dropped request details: \n%v", requests)
+				// recording the drop counter separately from recordDynamoError(), as the error code alone may not provide enough context
+				// to determine if a request was dropped (or not)
+				for tableName := range requests {
+					dynamoDroppedRequests.WithLabelValues(tableName, validationException, "DynamoDB.BatchWriteItem").Inc()
+				}
 				continue
 			}
 
@@ -619,6 +638,16 @@ func (a storageClient) getDynamoDBChunks(ctx context.Context, chunks []chunk.Chu
 			if awsErr, ok := err.(awserr.Error); ok && ((awsErr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException) || request.Retryable()) {
 				unprocessed.TakeReqs(requests, -1)
 				backoff.Wait()
+				continue
+			} else if ok && awsErr.Code() == validationException {
+				// this read will never work, so the only option is to drop the offending request and continue.
+				level.Warn(util.Logger).Log("Error while fetching data from Dynamo: %v", awsErr)
+				level.Debug(util.Logger).Log("Dropped request details: \n%v", requests)
+				// recording the drop counter separately from recordDynamoError(), as the error code alone may not provide enough context
+				// to determine if a request was dropped (or not)
+				for tableName := range requests {
+					dynamoDroppedRequests.WithLabelValues(tableName, validationException, "DynamoDB.BatchGetItemPages").Inc()
+				}
 				continue
 			}
 

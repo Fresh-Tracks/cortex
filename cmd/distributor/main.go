@@ -15,6 +15,7 @@ import (
 	"github.com/weaveworks/common/server"
 	"github.com/weaveworks/common/tracing"
 	"github.com/weaveworks/cortex/pkg/distributor"
+	"github.com/weaveworks/cortex/pkg/ingester/client"
 	"github.com/weaveworks/cortex/pkg/ring"
 	"github.com/weaveworks/cortex/pkg/util"
 )
@@ -43,15 +44,16 @@ func main() {
 			GRPCMiddleware: []grpc.UnaryServerInterceptor{
 				middleware.ServerUserHeaderInterceptor,
 			},
+			ExcludeRequestInLog: true,
 		}
 		ringConfig        ring.Config
 		distributorConfig distributor.Config
-		logLevel          util.LogLevel
+		preallocConfig    client.PreallocConfig
 	)
-	util.RegisterFlags(&serverConfig, &ringConfig, &distributorConfig, &logLevel)
+	util.RegisterFlags(&serverConfig, &ringConfig, &distributorConfig, &preallocConfig)
 	flag.Parse()
 
-	util.InitLogger(logLevel.AllowedLevel)
+	util.InitLogger(&serverConfig)
 
 	// Setting the environment variable JAEGER_AGENT_HOST enables tracing
 	trace := tracing.NewFromEnv("distributor")
@@ -62,6 +64,7 @@ func main() {
 		level.Error(util.Logger).Log("msg", "error initializing ring", "err", err)
 		os.Exit(1)
 	}
+	prometheus.MustRegister(r)
 	defer r.Stop()
 
 	dist, err := distributor.New(distributorConfig, r)
@@ -70,7 +73,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer dist.Stop()
-	prometheus.MustRegister(dist)
 
 	server, err := server.New(serverConfig)
 	if err != nil {

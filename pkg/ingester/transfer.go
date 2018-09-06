@@ -41,7 +41,7 @@ func init() {
 // TransferChunks receives all the chunks from another ingester.
 func (i *Ingester) TransferChunks(stream client.Ingester_TransferChunksServer) error {
 	// Enter JOINING state (only valid from PENDING)
-	if err := i.lifecycler.ChangeState(ring.JOINING); err != nil {
+	if err := i.lifecycler.ChangeState(stream.Context(), ring.JOINING); err != nil {
 		return err
 	}
 
@@ -57,15 +57,16 @@ func (i *Ingester) TransferChunks(stream client.Ingester_TransferChunksServer) e
 
 		// Enter PENDING state (only valid from JOINING)
 		if i.lifecycler.GetState() == ring.JOINING {
-			if err := i.lifecycler.ChangeState(ring.PENDING); err != nil {
+			if err := i.lifecycler.ChangeState(stream.Context(), ring.PENDING); err != nil {
 				level.Error(util.Logger).Log("msg", "error rolling back failed TransferChunks", "err", err)
 				os.Exit(1)
 			}
 		}
 	}()
 
-	userStates := newUserStates(&i.cfg.userStatesConfig)
+	userStates := newUserStates(i.limits, i.cfg)
 	fromIngesterID := ""
+	seriesReceived := 0
 
 	for {
 		wireSeries, err := stream.Recv()
@@ -102,18 +103,29 @@ func (i *Ingester) TransferChunks(stream client.Ingester_TransferChunksServer) e
 			return err
 		}
 
-		i.memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
+		seriesReceived++
+		memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
 		receivedChunks.Add(float64(len(descs)))
 	}
 
-	if err := i.lifecycler.ClaimTokensFor(fromIngesterID); err != nil {
+	if fromIngesterID == "" {
+		level.Error(util.Logger).Log("msg", "received TransferChunks request with no ID from ingester")
+		return fmt.Errorf("no ingester id")
+	}
+
+	if seriesReceived == 0 {
+		level.Error(util.Logger).Log("msg", "received TransferChunks request with no series", "from_ingester", fromIngesterID)
+		return fmt.Errorf("no series")
+	}
+
+	if err := i.lifecycler.ClaimTokensFor(stream.Context(), fromIngesterID); err != nil {
 		return err
 	}
 
 	i.userStatesMtx.Lock()
 	defer i.userStatesMtx.Unlock()
 
-	if err := i.lifecycler.ChangeState(ring.ACTIVE); err != nil {
+	if err := i.lifecycler.ChangeState(stream.Context(), ring.ACTIVE); err != nil {
 		return err
 	}
 	i.userStates = userStates
@@ -173,8 +185,8 @@ func fromWireChunks(wireChunks []client.Chunk) ([]*desc, error) {
 
 // TransferOut finds an ingester in PENDING state and transfers our chunks to it.
 // Called as part of the ingester shutdown process.
-func (i *Ingester) TransferOut() error {
-	targetIngester, err := i.findTargetIngester()
+func (i *Ingester) TransferOut(ctx context.Context) error {
+	targetIngester, err := i.findTargetIngester(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot find ingester to transfer chunks to: %v", err)
 	}
@@ -186,7 +198,7 @@ func (i *Ingester) TransferOut() error {
 	}
 	defer c.(io.Closer).Close()
 
-	ctx := user.InjectOrgID(context.Background(), "-1")
+	ctx = user.InjectOrgID(ctx, "-1")
 	stream, err := c.TransferChunks(ctx)
 	if err != nil {
 		return err
@@ -238,9 +250,9 @@ func (i *Ingester) TransferOut() error {
 }
 
 // findTargetIngester finds an ingester in PENDING state.
-func (i *Ingester) findTargetIngester() (*ring.IngesterDesc, error) {
+func (i *Ingester) findTargetIngester(ctx context.Context) (*ring.IngesterDesc, error) {
 	findIngester := func() (*ring.IngesterDesc, error) {
-		ringDesc, err := i.lifecycler.KVStore.Get(ring.ConsulKey)
+		ringDesc, err := i.lifecycler.KVStore.Get(ctx, ring.ConsulKey)
 		if err != nil {
 			return nil, err
 		}

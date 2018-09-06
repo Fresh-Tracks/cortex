@@ -27,19 +27,18 @@ func main() {
 		ingesterConfig ingester.Config
 		storageConfig  storage.Config
 		schemaConfig   chunk.SchemaConfig
-		logLevel       util.LogLevel
 	)
-	util.RegisterFlags(&ingesterConfig, &serverConfig, &storageConfig, &schemaConfig, &logLevel)
+	util.RegisterFlags(&ingesterConfig, &serverConfig, &storageConfig, &schemaConfig)
 	flag.Parse()
 
-	util.InitLogger(logLevel.AllowedLevel)
+	util.InitLogger(&serverConfig)
 
 	if (schemaConfig.ChunkTables.WriteScale.Enabled ||
 		schemaConfig.IndexTables.WriteScale.Enabled ||
 		schemaConfig.ChunkTables.InactiveWriteScale.Enabled ||
 		schemaConfig.IndexTables.InactiveWriteScale.Enabled) &&
-		storageConfig.AWSStorageConfig.ApplicationAutoScaling.URL == nil {
-		level.Error(util.Logger).Log("msg", "WriteScale is enabled but no ApplicationAutoScaling URL has been provided")
+		(storageConfig.AWSStorageConfig.ApplicationAutoScaling.URL == nil && storageConfig.AWSStorageConfig.Metrics.URL == "") {
+		level.Error(util.Logger).Log("msg", "WriteScale is enabled but no ApplicationAutoScaling or Metrics URL has been provided")
 		os.Exit(1)
 	}
 

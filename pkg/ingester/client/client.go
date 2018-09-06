@@ -6,10 +6,21 @@ import (
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/mwitkow/go-grpc-middleware"
 	"github.com/opentracing/opentracing-go"
-	"github.com/weaveworks/common/middleware"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/encoding/gzip" // get gzip compressor registered
+
+	"github.com/weaveworks/common/middleware"
+	cortex_middleware "github.com/weaveworks/cortex/pkg/util/middleware"
 )
+
+var ingesterClientRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: "cortex",
+	Name:      "ingester_client_request_duration_seconds",
+	Help:      "Time spent doing Ingester requests.",
+	Buckets:   prometheus.ExponentialBuckets(0.001, 4, 6),
+}, []string{"operation", "status_code"})
 
 type closableIngesterClient struct {
 	IngesterClient
@@ -23,6 +34,12 @@ func MakeIngesterClient(addr string, cfg Config) (IngesterClient, error) {
 		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
 			otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 			middleware.ClientUserHeaderInterceptor,
+			cortex_middleware.PrometheusGRPCUnaryInstrumentation(ingesterClientRequestDuration),
+		)),
+		grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(
+			otgrpc.OpenTracingStreamClientInterceptor(opentracing.GlobalTracer()),
+			middleware.StreamClientUserHeaderInterceptor,
+			cortex_middleware.PrometheusGRPCStreamInstrumentation(ingesterClientRequestDuration),
 		)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(cfg.MaxRecvMsgSize)),
 	}
@@ -53,7 +70,7 @@ type Config struct {
 	legacyCompressToIngester bool
 }
 
-// RegisterFlags registers configuration settings used by the ingester client config
+// RegisterFlags registers configuration settings used by the ingester client config.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	// lite uses both ingester.Config and distributor.Config.
 	// Both of them has IngesterClientConfig, so calling RegisterFlags on them triggers panic.
@@ -63,7 +80,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	}
 	// We have seen 20MB returns from queries - add a bit of headroom
 	f.IntVar(&cfg.MaxRecvMsgSize, "ingester.client.max-recv-message-size", 64*1024*1024, "Maximum message size, in bytes, this client will receive.")
-	flag.BoolVar(&cfg.CompressToIngester, "ingester.client.compress-to-ingester", false, "Compress data in calls to ingesters.")
+	f.BoolVar(&cfg.CompressToIngester, "ingester.client.compress-to-ingester", false, "Compress data in calls to ingesters.")
 	// moved from distributor pkg, but flag prefix left as back compat fallback for existing users.
-	flag.BoolVar(&cfg.legacyCompressToIngester, "distributor.compress-to-ingester", false, "Compress data in calls to ingesters. (DEPRECATED: use ingester.client.compress-to-ingester instead")
+	f.BoolVar(&cfg.legacyCompressToIngester, "distributor.compress-to-ingester", false, "Compress data in calls to ingesters. (DEPRECATED: use ingester.client.compress-to-ingester instead")
 }

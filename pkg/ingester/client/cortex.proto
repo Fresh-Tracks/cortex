@@ -13,6 +13,8 @@ option (gogoproto.unmarshaler_all) = true;
 service Ingester {
   rpc Push(WriteRequest) returns (WriteResponse) {};
   rpc Query(QueryRequest) returns (QueryResponse) {};
+  rpc QueryStream(QueryRequest) returns (stream QueryStreamResponse) {};
+
   rpc LabelValues(LabelValuesRequest) returns (LabelValuesResponse) {};
   rpc UserStats(UserStatsRequest) returns (UserStatsResponse) {};
   rpc AllUserStats(UserStatsRequest) returns (UsersStatsResponse) {};
@@ -24,7 +26,12 @@ service Ingester {
 }
 
 message WriteRequest {
-  repeated TimeSeries timeseries = 1 [(gogoproto.nullable) = false];
+  repeated TimeSeries timeseries = 1 [(gogoproto.nullable) = false, (gogoproto.customtype) = "PreallocTimeseries"];
+  enum SourceEnum {
+    API = 0;
+    RULE = 1;
+  }
+  SourceEnum Source = 2;
 }
 
 message WriteResponse {}
@@ -47,6 +54,11 @@ message QueryResponse {
   repeated TimeSeries timeseries = 1 [(gogoproto.nullable) = false];
 }
 
+// QueryStreamResponse contains a batch of timeseries chunks.
+message QueryStreamResponse {
+  repeated TimeSeriesChunk timeseries = 1 [(gogoproto.nullable) = false];
+}
+
 message LabelValuesRequest {
   string label_name = 1;
 }
@@ -60,6 +72,8 @@ message UserStatsRequest {}
 message UserStatsResponse {
   double ingestion_rate = 1;
   uint64 num_series = 2;
+  double api_ingestion_rate = 3;
+  double rule_ingestion_rate = 4;
 }
 
 message UserIDStatsResponse {

@@ -12,59 +12,71 @@ import (
 	old_ctx "golang.org/x/net/context"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/weaveworks/cortex/pkg/prom1/storage/local/chunk"
 
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 	cortex_chunk "github.com/weaveworks/cortex/pkg/chunk"
 	"github.com/weaveworks/cortex/pkg/ingester/client"
 	"github.com/weaveworks/cortex/pkg/ring"
 	"github.com/weaveworks/cortex/pkg/util"
+	"github.com/weaveworks/cortex/pkg/util/validation"
 )
 
 const (
-	ingesterSubsystem  = "ingester"
-	discardReasonLabel = "reason"
-
 	// Reasons to discard samples.
-	outOfOrderTimestamp     = "timestamp_out_of_order"
-	duplicateSample         = "multiple_values_for_timestamp"
-	greaterThanMaxSampleAge = "greater_than_max_sample_age"
+	outOfOrderTimestamp = "timestamp_out_of_order"
+	duplicateSample     = "multiple_values_for_timestamp"
 
-	// DefaultConcurrentFlush is the number of series to flush concurrently
-	DefaultConcurrentFlush = 50
-	// DefaultMaxSeriesPerUser is the maximum number of series allowed per user.
-	DefaultMaxSeriesPerUser = 5000000
-	// DefaultMaxSeriesPerMetric is the maximum number of series in one metric (of a single user).
-	DefaultMaxSeriesPerMetric = 50000
+	// Number of timeseries to return in each batch of a QueryStream.
+	queryStreamBatchSize = 10
 )
 
 var (
-	memorySeriesDesc = prometheus.NewDesc(
-		"cortex_ingester_memory_series",
-		"The current number of series in memory.",
-		nil, nil,
-	)
-	memoryUsersDesc = prometheus.NewDesc(
-		"cortex_ingester_memory_users",
-		"The current number of users in memory.",
-		nil, nil,
-	)
-	flushQueueLengthDesc = prometheus.NewDesc(
-		"cortex_ingester_flush_queue_length",
-		"The total number of series pending in the flush queue.",
-		nil, nil,
-	)
+	flushQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cortex_ingester_flush_queue_length",
+		Help: "The total number of series pending in the flush queue.",
+	})
+	ingestedSamples = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cortex_ingester_ingested_samples_total",
+		Help: "The total number of samples ingested.",
+	})
+	ingestedSamplesFail = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cortex_ingester_ingested_samples_failures_total",
+		Help: "The total number of samples that errored on ingestion.",
+	})
+	queries = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cortex_ingester_queries_total",
+		Help: "The total number of queries the ingester has handled.",
+	})
+	queriedSamples = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "cortex_ingester_queried_samples",
+		Help: "The total number of samples returned from queries.",
+		// Could easily return 10m samples per query - 80*(8^9) = 10.7m.
+		Buckets: prometheus.ExponentialBuckets(80, 8, 9),
+	})
+	queriedSeries = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "cortex_ingester_queried_series",
+		Help: "The total number of series returned from queries.",
+		// A reasonable upper bound is around 100k - 10*(8^8) = 167k.
+		Buckets: prometheus.ExponentialBuckets(10, 8, 8),
+	})
+	queriedChunks = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "cortex_ingester_queried_chunks",
+		Help: "The total number of chunks returned from queries.",
+		// A small number of chunks per series - 10*(4^8) = 655k.
+		Buckets: prometheus.DefBuckets,
+	})
 )
 
 // Config for an Ingester.
 type Config struct {
 	LifecyclerConfig ring.LifecyclerConfig
-	userStatesConfig UserStatesConfig
 	clientConfig     client.Config
+	limits           validation.Limits
 
 	// Config for transferring chunks.
 	SearchPendingFor time.Duration
@@ -77,11 +89,9 @@ type Config struct {
 	ConcurrentFlushes int
 	ChunkEncoding     string
 
-	// Config for rejecting old samples
-	RejectOldSamples       bool
-	RejectOldSamplesMaxAge time.Duration
+	RateUpdatePeriod time.Duration
 
-	// For unit testing.
+	// For testing, you can override the address and ID of this ingester.
 	ingesterClientFactory func(addr string, cfg client.Config) (client.IngesterClient, error)
 }
 
@@ -93,20 +103,24 @@ func (cfg *Config) SetClientConfig(clientConfig client.Config) {
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.LifecyclerConfig.RegisterFlags(f)
-	cfg.userStatesConfig.RegisterFlags(f)
 	cfg.clientConfig.RegisterFlags(f)
+	cfg.limits.RegisterFlags(f)
 
 	f.DurationVar(&cfg.SearchPendingFor, "ingester.search-pending-for", 30*time.Second, "Time to spend searching for a pending ingester when shutting down.")
-
 	f.DurationVar(&cfg.FlushCheckPeriod, "ingester.flush-period", 1*time.Minute, "Period with which to attempt to flush chunks.")
 	f.DurationVar(&cfg.FlushOpTimeout, "ingester.flush-op-timeout", 1*time.Minute, "Timeout for individual flush operations.")
 	f.DurationVar(&cfg.MaxChunkIdle, "ingester.max-chunk-idle", 5*time.Minute, "Maximum chunk idle time before flushing.")
 	f.DurationVar(&cfg.MaxChunkAge, "ingester.max-chunk-age", 12*time.Hour, "Maximum chunk age before flushing.")
-	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", DefaultConcurrentFlush, "Number of concurrent goroutines flushing to dynamodb.")
+	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", 50, "Number of concurrent goroutines flushing to dynamodb.")
 	f.StringVar(&cfg.ChunkEncoding, "ingester.chunk-encoding", "1", "Encoding version to use for chunks.")
+	f.DurationVar(&cfg.RateUpdatePeriod, "ingester.rate-update-period", 15*time.Second, "Period with which to update the per-user ingestion rates.")
 
-	f.BoolVar(&cfg.RejectOldSamples, "ingester.reject-old-samples", false, "Reject old samples.")
-	f.DurationVar(&cfg.RejectOldSamplesMaxAge, "ingester.reject-old-samples.max-age", 14*24*time.Hour, "Maximum accepted sample age before rejecting.")
+	// DEPRECATED, no-op
+	f.Bool("ingester.reject-old-samples", false, "DEPRECATED. Reject old samples.")
+	f.Duration("ingester.reject-old-samples.max-age", 0, "DEPRECATED. Maximum accepted sample age before rejecting.")
+	f.Int("ingester.validation.max-length-label-name", 0, "DEPRECATED. Maximum length accepted for label names.")
+	f.Int("ingester.validation.max-length-label-value", 0, "DEPRECATED. Maximum length accepted for label value. This setting also applies to the metric name.")
+	f.Int("ingester.max-label-names-per-series", 0, "DEPRECATED. Maximum number of label names per series.")
 }
 
 // Ingester deals with "in flight" chunks.  Based on Prometheus 1.x
@@ -115,6 +129,7 @@ type Ingester struct {
 	cfg        Config
 	chunkStore ChunkStore
 	lifecycler *ring.Lifecycler
+	limits     *validation.Overrides
 
 	stopLock sync.RWMutex
 	stopped  bool
@@ -131,14 +146,6 @@ type Ingester struct {
 
 	// Hook for injecting behaviour from tests.
 	preFlushUserSeries func()
-
-	ingestedSamples  prometheus.Counter
-	chunkUtilization prometheus.Histogram
-	chunkLength      prometheus.Histogram
-	chunkAge         prometheus.Histogram
-	queries          prometheus.Counter
-	queriedSamples   prometheus.Counter
-	memoryChunks     prometheus.Gauge
 }
 
 // ChunkStore is the interface we need to store chunks
@@ -148,27 +155,6 @@ type ChunkStore interface {
 
 // New constructs a new Ingester.
 func New(cfg Config, chunkStore ChunkStore) (*Ingester, error) {
-	if cfg.FlushCheckPeriod == 0 {
-		cfg.FlushCheckPeriod = 1 * time.Minute
-	}
-	if cfg.MaxChunkIdle == 0 {
-		cfg.MaxChunkIdle = 1 * time.Hour
-	}
-	if cfg.ConcurrentFlushes <= 0 {
-		cfg.ConcurrentFlushes = DefaultConcurrentFlush
-	}
-	if cfg.ChunkEncoding == "" {
-		cfg.ChunkEncoding = "1"
-	}
-	if cfg.userStatesConfig.RateUpdatePeriod == 0 {
-		cfg.userStatesConfig.RateUpdatePeriod = 15 * time.Second
-	}
-	if cfg.userStatesConfig.MaxSeriesPerUser <= 0 {
-		cfg.userStatesConfig.MaxSeriesPerUser = DefaultMaxSeriesPerUser
-	}
-	if cfg.userStatesConfig.MaxSeriesPerMetric <= 0 {
-		cfg.userStatesConfig.MaxSeriesPerMetric = DefaultMaxSeriesPerMetric
-	}
 	if cfg.ingesterClientFactory == nil {
 		cfg.ingesterClientFactory = client.MakeIngesterClient
 	}
@@ -177,51 +163,22 @@ func New(cfg Config, chunkStore ChunkStore) (*Ingester, error) {
 		return nil, err
 	}
 
+	limits, err := validation.NewOverrides(cfg.limits)
+	if err != nil {
+		return nil, err
+	}
+
 	i := &Ingester{
 		cfg: cfg,
 
+		limits:     limits,
 		chunkStore: chunkStore,
-		userStates: newUserStates(&cfg.userStatesConfig),
+		userStates: newUserStates(limits, cfg),
 
 		quit:        make(chan struct{}),
 		flushQueues: make([]*util.PriorityQueue, cfg.ConcurrentFlushes, cfg.ConcurrentFlushes),
-
-		ingestedSamples: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cortex_ingester_ingested_samples_total",
-			Help: "The total number of samples ingested.",
-		}),
-		chunkUtilization: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "cortex_ingester_chunk_utilization",
-			Help:    "Distribution of stored chunk utilization (when stored).",
-			Buckets: prometheus.LinearBuckets(0, 0.2, 6),
-		}),
-		chunkLength: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "cortex_ingester_chunk_length",
-			Help:    "Distribution of stored chunk lengths (when stored).",
-			Buckets: prometheus.ExponentialBuckets(5, 2, 11), // biggest bucket is 5*2^(11-1) = 5120
-		}),
-		chunkAge: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name: "cortex_ingester_chunk_age_seconds",
-			Help: "Distribution of chunk ages (when stored).",
-			// with default settings chunks should flush between 5 min and 12 hours
-			// so buckets at 1min, 5min, 10min, 30min, 1hr, 2hr, 4hr, 10hr, 12hr, 16hr
-			Buckets: []float64{60, 300, 600, 1800, 3600, 7200, 14400, 36000, 43200, 57600},
-		}),
-		memoryChunks: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "cortex_ingester_memory_chunks",
-			Help: "The total number of chunks in memory.",
-		}),
-		queries: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cortex_ingester_queries_total",
-			Help: "The total number of queries the ingester has handled.",
-		}),
-		queriedSamples: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cortex_ingester_queried_samples_total",
-			Help: "The total number of samples returned from queries.",
-		}),
 	}
 
-	var err error
 	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i)
 	if err != nil {
 		return nil, err
@@ -229,7 +186,7 @@ func New(cfg Config, chunkStore ChunkStore) (*Ingester, error) {
 
 	i.flushQueuesDone.Add(cfg.ConcurrentFlushes)
 	for j := 0; j < cfg.ConcurrentFlushes; j++ {
-		i.flushQueues[j] = util.NewPriorityQueue()
+		i.flushQueues[j] = util.NewPriorityQueue(flushQueueLength)
 		go i.flushLoop(j)
 	}
 
@@ -245,7 +202,7 @@ func (i *Ingester) loop() {
 	flushTicker := time.NewTicker(i.cfg.FlushCheckPeriod)
 	defer flushTicker.Stop()
 
-	rateUpdateTicker := time.NewTicker(i.cfg.userStatesConfig.RateUpdatePeriod)
+	rateUpdateTicker := time.NewTicker(i.cfg.RateUpdatePeriod)
 	defer rateUpdateTicker.Stop()
 
 	for {
@@ -264,6 +221,8 @@ func (i *Ingester) loop() {
 
 // Shutdown beings the process to stop this ingester.
 func (i *Ingester) Shutdown() {
+	i.limits.Stop()
+
 	// First wait for our flush loop to stop.
 	close(i.quit)
 	i.done.Wait()
@@ -284,34 +243,28 @@ func (i *Ingester) Push(ctx old_ctx.Context, req *client.WriteRequest) (*client.
 	var lastPartialErr error
 	samples := client.FromWriteRequest(req)
 
-samples:
 	for j := range samples {
-		if err := i.append(ctx, &samples[j]); err != nil {
-			if httpResp, ok := httpgrpc.HTTPResponseFromError(err); ok {
-				switch httpResp.Code {
-				case http.StatusBadRequest, http.StatusTooManyRequests:
-					lastPartialErr = err
-					continue samples
-				}
-			}
-			return nil, err
+		err := i.append(ctx, &samples[j], req.Source)
+		if err == nil {
+			continue
 		}
+
+		ingestedSamplesFail.Inc()
+		if httpResp, ok := httpgrpc.HTTPResponseFromError(err); ok {
+			switch httpResp.Code {
+			case http.StatusBadRequest, http.StatusTooManyRequests:
+				lastPartialErr = err
+				continue
+			}
+		}
+
+		return nil, err
 	}
 
 	return &client.WriteResponse{}, lastPartialErr
 }
 
-func (i *Ingester) append(ctx context.Context, sample *model.Sample) error {
-	if i.cfg.RejectOldSamples && sample.Timestamp < model.Now().Add(-i.cfg.RejectOldSamplesMaxAge) {
-		discardedSamples.WithLabelValues(greaterThanMaxSampleAge).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, "sample with timestamp %v is older than the maximum accepted age", sample.Timestamp)
-	}
-
-	if err := util.ValidateSample(sample); err != nil {
-		level.Error(util.WithContext(ctx, util.Logger)).Log("msg", "error validating sample", "err", err)
-		return nil
-	}
-
+func (i *Ingester) append(ctx context.Context, sample *model.Sample, source client.WriteRequest_SourceEnum) error {
 	for ln, lv := range sample.Metric {
 		if len(lv) == 0 {
 			delete(sample.Metric, ln)
@@ -339,67 +292,155 @@ func (i *Ingester) append(ctx context.Context, sample *model.Sample) error {
 		Value:     sample.Value,
 		Timestamp: sample.Timestamp,
 	}); err != nil {
+		if mse, ok := err.(*memorySeriesError); ok {
+			validation.DiscardedSamples.WithLabelValues(mse.errorType, state.userID).Inc()
+			// Use a dumb string template to avoid the message being parsed as a template
+			err = httpgrpc.Errorf(http.StatusBadRequest, "%s", mse.message)
+		}
 		return err
 	}
 
-	i.memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
-	i.ingestedSamples.Inc()
-	state.ingestedSamples.inc()
+	memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
+	ingestedSamples.Inc()
+	switch source {
+	case client.RULE:
+		state.ingestedRuleSamples.inc()
+	case client.API:
+		fallthrough
+	default:
+		state.ingestedAPISamples.inc()
+	}
 
 	return err
 }
 
 // Query implements service.IngesterServer
 func (i *Ingester) Query(ctx old_ctx.Context, req *client.QueryRequest) (*client.QueryResponse, error) {
-	start, end, matchers, err := client.FromQueryRequest(req)
+	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	matrix, err := i.query(ctx, start, end, matchers)
+	from, through, matchers, err := client.FromQueryRequest(req)
 	if err != nil {
 		return nil, err
 	}
 
-	return client.ToQueryResponse(matrix), nil
-}
-
-func (i *Ingester) query(ctx context.Context, from, through model.Time, matchers []*labels.Matcher) (model.Matrix, error) {
-	i.queries.Inc()
+	queries.Inc()
 
 	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	state, err := i.userStates.getOrCreate(ctx)
+	state, ok, err := i.userStates.getViaContext(ctx)
+	i.userStatesMtx.RUnlock()
 	if err != nil {
 		return nil, err
+	} else if !ok {
+		return &client.QueryResponse{}, nil
 	}
 
-	queriedSamples := 0
 	result := model.Matrix{}
+	numSeries, numSamples := 0, 0
+	maxSamplesPerQuery := i.limits.MaxSamplesPerQuery(userID)
 	err = state.forSeriesMatching(matchers, func(_ model.Fingerprint, series *memorySeries) error {
 		values, err := series.samplesForRange(from, through)
 		if err != nil {
 			return err
+		}
+		if len(values) == 0 {
+			return nil
+		}
+		numSeries++
+
+		numSamples += len(values)
+		if numSamples > maxSamplesPerQuery {
+			return httpgrpc.Errorf(http.StatusRequestEntityTooLarge, "exceeded maximum number of samples in a query (%d)", maxSamplesPerQuery)
 		}
 
 		result = append(result, &model.SampleStream{
 			Metric: series.metric,
 			Values: values,
 		})
-		queriedSamples += len(values)
 		return nil
 	})
-	i.queriedSamples.Add(float64(queriedSamples))
-	return result, err
+	queriedSeries.Observe(float64(numSeries))
+	queriedSamples.Observe(float64(numSamples))
+	return client.ToQueryResponse(result), err
+}
+
+// QueryStream implements service.IngesterServer
+func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_QueryStreamServer) error {
+	_, _, matchers, err := client.FromQueryRequest(req)
+	if err != nil {
+		return err
+	}
+
+	queries.Inc()
+
+	i.userStatesMtx.RLock()
+	state, ok, err := i.userStates.getViaContext(stream.Context())
+	i.userStatesMtx.RUnlock()
+	if err != nil {
+		return err
+	} else if !ok {
+		return nil
+	}
+
+	numSeries, numChunks := 0, 0
+	batch := make([]client.TimeSeriesChunk, 0, queryStreamBatchSize)
+	// We'd really like to have series in label order, not FP order, so we
+	// can iteratively merge them with entries coming from the chunk store.  But
+	// that would involve locking all the series & sorting, so until we have
+	// a better solution in the ingesters I'd rather take the hit in the queriers.
+	err = state.forSeriesMatching(matchers, func(_ model.Fingerprint, series *memorySeries) error {
+		numSeries++
+		chunks := make([]*desc, 0, len(series.chunkDescs))
+		for _, chunk := range series.chunkDescs {
+			if !(chunk.FirstTime.After(model.Time(req.EndTimestampMs)) || chunk.LastTime.Before(model.Time(req.StartTimestampMs))) {
+				chunks = append(chunks, chunk)
+			}
+		}
+
+		wireChunks, err := toWireChunks(chunks)
+		if err != nil {
+			return err
+		}
+
+		numChunks += len(wireChunks)
+		batch = append(batch, client.TimeSeriesChunk{
+			Labels: client.ToLabelPairs(series.metric),
+			Chunks: wireChunks,
+		})
+
+		if len(batch) >= queryStreamBatchSize {
+			err = stream.Send(&client.QueryStreamResponse{
+				Timeseries: batch,
+			})
+			batch = batch[:0]
+		}
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(batch) > 0 {
+		err = stream.Send(&client.QueryStreamResponse{
+			Timeseries: batch,
+		})
+	}
+	queriedSeries.Observe(float64(numSeries))
+	queriedChunks.Observe(float64(numChunks))
+	return err
 }
 
 // LabelValues returns all label values that are associated with a given label name.
 func (i *Ingester) LabelValues(ctx old_ctx.Context, req *client.LabelValuesRequest) (*client.LabelValuesResponse, error) {
 	i.userStatesMtx.RLock()
 	defer i.userStatesMtx.RUnlock()
-	state, err := i.userStates.getOrCreate(ctx)
+	state, ok, err := i.userStates.getViaContext(ctx)
 	if err != nil {
 		return nil, err
+	} else if !ok {
+		return &client.LabelValuesResponse{}, nil
 	}
 
 	resp := &client.LabelValuesResponse{}
@@ -414,9 +455,11 @@ func (i *Ingester) LabelValues(ctx old_ctx.Context, req *client.LabelValuesReque
 func (i *Ingester) MetricsForLabelMatchers(ctx old_ctx.Context, req *client.MetricsForLabelMatchersRequest) (*client.MetricsForLabelMatchersResponse, error) {
 	i.userStatesMtx.RLock()
 	defer i.userStatesMtx.RUnlock()
-	state, err := i.userStates.getOrCreate(ctx)
+	state, ok, err := i.userStates.getViaContext(ctx)
 	if err != nil {
 		return nil, err
+	} else if !ok {
+		return client.ToMetricsForLabelMatchersResponse(nil), nil
 	}
 
 	// TODO Right now we ignore start and end.
@@ -449,14 +492,20 @@ func (i *Ingester) MetricsForLabelMatchers(ctx old_ctx.Context, req *client.Metr
 func (i *Ingester) UserStats(ctx old_ctx.Context, req *client.UserStatsRequest) (*client.UserStatsResponse, error) {
 	i.userStatesMtx.RLock()
 	defer i.userStatesMtx.RUnlock()
-	state, err := i.userStates.getOrCreate(ctx)
+	state, ok, err := i.userStates.getViaContext(ctx)
 	if err != nil {
 		return nil, err
+	} else if !ok {
+		return &client.UserStatsResponse{}, nil
 	}
 
+	apiRate := state.ingestedAPISamples.rate()
+	ruleRate := state.ingestedRuleSamples.rate()
 	return &client.UserStatsResponse{
-		IngestionRate: state.ingestedSamples.rate(),
-		NumSeries:     uint64(state.fpToSeries.length()),
+		IngestionRate:     apiRate + ruleRate,
+		ApiIngestionRate:  apiRate,
+		RuleIngestionRate: ruleRate,
+		NumSeries:         uint64(state.fpToSeries.length()),
 	}, nil
 }
 
@@ -470,11 +519,15 @@ func (i *Ingester) AllUserStats(ctx old_ctx.Context, req *client.UserStatsReques
 		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
 	}
 	for userID, state := range users {
+		apiRate := state.ingestedAPISamples.rate()
+		ruleRate := state.ingestedRuleSamples.rate()
 		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
 			UserId: userID,
 			Data: &client.UserStatsResponse{
-				IngestionRate: state.ingestedSamples.rate(),
-				NumSeries:     uint64(state.fpToSeries.length()),
+				IngestionRate:     apiRate + ruleRate,
+				ApiIngestionRate:  apiRate,
+				RuleIngestionRate: ruleRate,
+				NumSeries:         uint64(state.fpToSeries.length()),
 			},
 		})
 	}
@@ -490,59 +543,9 @@ func (i *Ingester) Check(ctx old_ctx.Context, req *grpc_health_v1.HealthCheckReq
 // the addition removal of another ingester. Returns 204 when the ingester is
 // ready, 500 otherwise.
 func (i *Ingester) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
-	if i.lifecycler.IsReady() {
+	if i.lifecycler.IsReady(r.Context()) {
 		w.WriteHeader(http.StatusNoContent)
 	} else {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-}
-
-// Describe implements prometheus.Collector.
-func (i *Ingester) Describe(ch chan<- *prometheus.Desc) {
-	ch <- memorySeriesDesc
-	ch <- memoryUsersDesc
-	ch <- flushQueueLengthDesc
-	ch <- i.ingestedSamples.Desc()
-	ch <- i.chunkUtilization.Desc()
-	ch <- i.chunkLength.Desc()
-	ch <- i.chunkAge.Desc()
-	ch <- i.queries.Desc()
-	ch <- i.queriedSamples.Desc()
-	ch <- i.memoryChunks.Desc()
-}
-
-// Collect implements prometheus.Collector.
-func (i *Ingester) Collect(ch chan<- prometheus.Metric) {
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	numUsers := i.userStates.numUsers()
-	numSeries := i.userStates.numSeries()
-
-	ch <- prometheus.MustNewConstMetric(
-		memorySeriesDesc,
-		prometheus.GaugeValue,
-		float64(numSeries),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		memoryUsersDesc,
-		prometheus.GaugeValue,
-		float64(numUsers),
-	)
-
-	flushQueueLength := 0
-	for _, flushQueue := range i.flushQueues {
-		flushQueueLength += flushQueue.Length()
-	}
-	ch <- prometheus.MustNewConstMetric(
-		flushQueueLengthDesc,
-		prometheus.GaugeValue,
-		float64(flushQueueLength),
-	)
-	ch <- i.ingestedSamples
-	ch <- i.chunkUtilization
-	ch <- i.chunkLength
-	ch <- i.chunkAge
-	ch <- i.queries
-	ch <- i.queriedSamples
-	ch <- i.memoryChunks
 }

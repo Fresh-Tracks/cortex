@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/promql"
 	"google.golang.org/grpc"
 
 	"github.com/weaveworks/common/middleware"
@@ -36,7 +35,7 @@ func main() {
 		schemaConfig      chunk.SchemaConfig
 		storageConfig     storage.Config
 		configStoreConfig ruler.ConfigStoreConfig
-		logLevel          util.LogLevel
+		querierConfig     querier.Config
 	)
 
 	// Setting the environment variable JAEGER_AGENT_HOST enables tracing
@@ -44,18 +43,18 @@ func main() {
 	defer trace.Close()
 
 	util.RegisterFlags(&serverConfig, &ringConfig, &distributorConfig,
-		&rulerConfig, &chunkStoreConfig, &storageConfig, &schemaConfig, &configStoreConfig, &logLevel)
+		&rulerConfig, &chunkStoreConfig, &storageConfig, &schemaConfig, &configStoreConfig,
+		&querierConfig)
 	flag.Parse()
 
-	util.InitLogger(logLevel.AllowedLevel)
+	util.InitLogger(&serverConfig)
 
-	storageClient, err := storage.NewStorageClient(storageConfig, schemaConfig)
+	storageOpts, err := storage.Opts(storageConfig, schemaConfig)
 	if err != nil {
 		level.Error(util.Logger).Log("msg", "error initializing storage client", "err", err)
 		os.Exit(1)
 	}
-
-	chunkStore, err := chunk.NewStore(chunkStoreConfig, schemaConfig, storageClient)
+	chunkStore, err := chunk.NewStore(chunkStoreConfig, schemaConfig, storageOpts)
 	if err != nil {
 		level.Error(util.Logger).Log("err", err)
 		os.Exit(1)
@@ -67,6 +66,7 @@ func main() {
 		level.Error(util.Logger).Log("msg", "error initializing ring", "err", err)
 		os.Exit(1)
 	}
+	prometheus.MustRegister(r)
 	defer r.Stop()
 
 	dist, err := distributor.New(distributorConfig, r)
@@ -75,11 +75,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer dist.Stop()
-	prometheus.MustRegister(dist)
 
-	engine := promql.NewEngine(util.Logger, prometheus.DefaultRegisterer, rulerConfig.NumWorkers, rulerConfig.GroupTimeout)
-	queryable := querier.NewQueryable(dist, chunkStore)
-
+	querierConfig.MaxConcurrent = rulerConfig.NumWorkers
+	querierConfig.Timeout = rulerConfig.GroupTimeout
+	queryable, engine := querier.New(querierConfig, dist, chunkStore)
 	rlr, err := ruler.NewRuler(rulerConfig, engine, queryable, dist)
 	if err != nil {
 		level.Error(util.Logger).Log("msg", "error initializing ruler", "err", err)

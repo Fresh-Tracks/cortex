@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/web/api/v1"
 	"github.com/prometheus/tsdb"
 	"google.golang.org/grpc"
@@ -48,14 +47,13 @@ func main() {
 		rulerConfig       ruler.Config
 		schemaConfig      chunk.SchemaConfig
 		storageConfig     storage.Config
-		logLevel          util.LogLevel
 
 		unauthenticated bool
 	)
 	// Ingester needs to know our gRPC listen port.
 	ingesterConfig.LifecyclerConfig.ListenPort = &serverConfig.GRPCListenPort
 	util.RegisterFlags(&serverConfig, &chunkStoreConfig, &distributorConfig, &querierConfig,
-		&ingesterConfig, &configStoreConfig, &rulerConfig, &storageConfig, &schemaConfig, &logLevel)
+		&ingesterConfig, &configStoreConfig, &rulerConfig, &storageConfig, &schemaConfig)
 	flag.BoolVar(&unauthenticated, "unauthenticated", false, "Set to true to disable multitenancy.")
 	flag.Parse()
 	ingesterConfig.SetClientConfig(distributorConfig.IngesterClientConfig)
@@ -64,7 +62,7 @@ func main() {
 	trace := tracing.NewFromEnv("ingester")
 	defer trace.Close()
 
-	util.InitLogger(logLevel.AllowedLevel)
+	util.InitLogger(&serverConfig)
 
 	server, err := server.New(serverConfig)
 	if err != nil {
@@ -73,13 +71,13 @@ func main() {
 	}
 	defer server.Shutdown()
 
-	storageClient, err := storage.NewStorageClient(storageConfig, schemaConfig)
+	storageOpts, err := storage.Opts(storageConfig, schemaConfig)
 	if err != nil {
 		level.Error(util.Logger).Log("msg", "error initializing storage client", "err", err)
 		os.Exit(1)
 	}
 
-	chunkStore, err := chunk.NewStore(chunkStoreConfig, schemaConfig, storageClient)
+	chunkStore, err := chunk.NewStore(chunkStoreConfig, schemaConfig, storageOpts)
 	if err != nil {
 		level.Error(util.Logger).Log("err", err)
 		os.Exit(1)
@@ -91,6 +89,7 @@ func main() {
 		level.Error(util.Logger).Log("msg", "error initializing ring", "err", err)
 		os.Exit(1)
 	}
+	prometheus.MustRegister(r)
 	defer r.Stop()
 	ingesterConfig.LifecyclerConfig.KVClient = r.KVClient
 
@@ -100,14 +99,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer dist.Stop()
-	prometheus.MustRegister(dist)
 
 	ingester, err := ingester.New(ingesterConfig, chunkStore)
 	if err != nil {
 		level.Error(util.Logger).Log("err", err)
 		os.Exit(1)
 	}
-	prometheus.MustRegister(ingester)
 	defer ingester.Shutdown()
 
 	tableClient, err := storage.NewTableClient(storageConfig)
@@ -124,8 +121,7 @@ func main() {
 	tableManager.Start()
 	defer tableManager.Stop()
 
-	engine := promql.NewEngine(util.Logger, nil, querierConfig.MaxConcurrent, querierConfig.Timeout)
-	queryable := querier.NewQueryable(dist, chunkStore)
+	queryable, engine := querier.New(querierConfig, dist, chunkStore)
 
 	if configStoreConfig.ConfigsAPIURL.String() != "" || configStoreConfig.DBConfig.URI != "" {
 		rulesAPI, err := ruler.NewRulesAPI(configStoreConfig)
@@ -158,6 +154,8 @@ func main() {
 		func(f http.HandlerFunc) http.HandlerFunc { return f },
 		func() *tsdb.DB { return nil }, // Only needed for admin APIs.
 		false, // Disable admin APIs.
+		util.Logger,
+		querier.DummyRulesRetriever{},
 	)
 	promRouter := route.New().WithPrefix("/api/prom/api/v1")
 	api.Register(promRouter)
@@ -186,7 +184,7 @@ func main() {
 
 	subrouter := server.HTTP.PathPrefix("/api/prom").Subrouter()
 	subrouter.PathPrefix("/api/v1").Handler(activeMiddleware.Wrap(promRouter))
-	subrouter.Path("/read").Handler(activeMiddleware.Wrap(http.HandlerFunc(queryable.RemoteReadHandler)))
+	subrouter.Path("/read").Handler(activeMiddleware.Wrap(querier.RemoteReadHandler(queryable)))
 	subrouter.Path("/validate_expr").Handler(activeMiddleware.Wrap(http.HandlerFunc(dist.ValidateExprHandler)))
 	subrouter.Path("/user_stats").Handler(activeMiddleware.Wrap(http.HandlerFunc(dist.UserStatsHandler)))
 

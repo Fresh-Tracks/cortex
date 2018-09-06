@@ -24,18 +24,21 @@ func FromWriteRequest(req *WriteRequest) []model.Sample {
 }
 
 // ToWriteRequest converts an array of samples into a WriteRequest proto.
-func ToWriteRequest(samples []model.Sample) *WriteRequest {
+func ToWriteRequest(samples []model.Sample, source WriteRequest_SourceEnum) *WriteRequest {
 	req := &WriteRequest{
-		Timeseries: make([]TimeSeries, 0, len(samples)),
+		Timeseries: make([]PreallocTimeseries, 0, len(samples)),
+		Source:     source,
 	}
 
 	for _, s := range samples {
-		ts := TimeSeries{
-			Labels: ToLabelPairs(s.Metric),
-			Samples: []Sample{
-				{
-					Value:       float64(s.Value),
-					TimestampMs: int64(s.Timestamp),
+		ts := PreallocTimeseries{
+			TimeSeries: TimeSeries{
+				Labels: ToLabelPairs(s.Metric),
+				Samples: []Sample{
+					{
+						Value:       float64(s.Value),
+						TimestampMs: int64(s.Timestamp),
+					},
 				},
 			},
 		}
@@ -228,4 +231,16 @@ func FromLabelPairs(labelPairs []LabelPair) model.Metric {
 		metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
 	}
 	return metric
+}
+
+// FromLabelPairsToLabels unpack a []LabelPair to a labels.Labels
+func FromLabelPairsToLabels(labelPairs []LabelPair) labels.Labels {
+	ls := make(labels.Labels, 0, len(labelPairs))
+	for _, l := range labelPairs {
+		ls = append(ls, labels.Label{
+			Name:  string(l.Name),
+			Value: string(l.Value),
+		})
+	}
+	return ls
 }

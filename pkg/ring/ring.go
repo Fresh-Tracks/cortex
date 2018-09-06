@@ -34,13 +34,6 @@ type ReadRing interface {
 	ReplicationFactor() int
 }
 
-// ReplicationSet describes the ingesters to talk to for a given key, and how
-// many errors to tolerate.
-type ReplicationSet struct {
-	Ingesters []*IngesterDesc
-	MaxErrors int
-}
-
 // Operation can be Read or Write
 type Operation int
 
@@ -90,6 +83,7 @@ type Ring struct {
 
 	ingesterOwnershipDesc *prometheus.Desc
 	numIngestersDesc      *prometheus.Desc
+	totalTokensDesc       *prometheus.Desc
 	numTokensDesc         *prometheus.Desc
 }
 
@@ -130,10 +124,15 @@ func New(cfg Config) (*Ring, error) {
 			"Number of ingesters in the ring",
 			[]string{"state"}, nil,
 		),
-		numTokensDesc: prometheus.NewDesc(
-			"cortex_ring_tokens",
+		totalTokensDesc: prometheus.NewDesc(
+			"cortex_ring_tokens_total",
 			"Number of tokens in the ring",
 			nil, nil,
+		),
+		numTokensDesc: prometheus.NewDesc(
+			"cortex_ring_tokens_owned",
+			"The number of tokens in the ring owned by the ingester",
+			[]string{"ingester"}, nil,
 		),
 	}
 	var ctx context.Context
@@ -283,10 +282,13 @@ func (r *Ring) search(key uint32) int {
 func (r *Ring) Describe(ch chan<- *prometheus.Desc) {
 	ch <- r.ingesterOwnershipDesc
 	ch <- r.numIngestersDesc
+	ch <- r.totalTokensDesc
 	ch <- r.numTokensDesc
 }
 
-func countTokens(tokens []*TokenDesc) (map[string]uint32, map[string]uint32) {
+func countTokens(ringDesc *Desc) (map[string]uint32, map[string]uint32) {
+	tokens := ringDesc.Tokens
+
 	owned := map[string]uint32{}
 	numTokens := map[string]uint32{}
 	for i, token := range tokens {
@@ -299,6 +301,14 @@ func countTokens(tokens []*TokenDesc) (map[string]uint32, map[string]uint32) {
 		numTokens[token.Ingester] = numTokens[token.Ingester] + 1
 		owned[token.Ingester] = owned[token.Ingester] + diff
 	}
+
+	for id := range ringDesc.Ingesters {
+		if _, ok := owned[id]; !ok {
+			owned[id] = 0
+			numTokens[id] = 0
+		}
+	}
+
 	return numTokens, owned
 }
 
@@ -307,12 +317,18 @@ func (r *Ring) Collect(ch chan<- prometheus.Metric) {
 	r.mtx.RLock()
 	defer r.mtx.RUnlock()
 
-	_, owned := countTokens(r.ringDesc.Tokens)
-	for id, totalOwned := range owned {
+	numTokens, ownedRange := countTokens(r.ringDesc)
+	for id, totalOwned := range ownedRange {
 		ch <- prometheus.MustNewConstMetric(
 			r.ingesterOwnershipDesc,
 			prometheus.GaugeValue,
 			float64(totalOwned)/float64(math.MaxUint32),
+			id,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			r.numTokensDesc,
+			prometheus.GaugeValue,
+			float64(numTokens[id]),
 			id,
 		)
 	}
@@ -342,7 +358,7 @@ func (r *Ring) Collect(ch chan<- prometheus.Metric) {
 		)
 	}
 	ch <- prometheus.MustNewConstMetric(
-		r.numTokensDesc,
+		r.totalTokensDesc,
 		prometheus.GaugeValue,
 		float64(len(r.ringDesc.Tokens)),
 	)

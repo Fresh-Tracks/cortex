@@ -107,20 +107,20 @@ configs-integration-test: build-image/$(UPTODATE)
 
 else
 
-$(EXES): build-image/$(UPTODATE)
+$(EXES):
 	go build $(GO_FLAGS) -o $@ ./$(@D)
 	$(NETGO_CHECK)
 
-%.pb.go: build-image/$(UPTODATE)
+%.pb.go:
 	protoc -I ./vendor:./$(@D) --gogoslick_out=plugins=grpc:./$(@D) ./$(patsubst %.pb.go,%.proto,$@)
 
-lint: build-image/$(UPTODATE)
+lint:
 	./tools/lint -notestpackage -ignorespelling queriers -ignorespelling Queriers .
 
-test: build-image/$(UPTODATE)
+test:
 	./tools/test -netgo
 
-shell: build-image/$(UPTODATE)
+shell:
 	bash
 
 configs-integration-test:
@@ -132,23 +132,6 @@ clean:
 	$(SUDO) docker rmi $(IMAGE_NAMES) >/dev/null 2>&1 || true
 	rm -rf $(UPTODATE_FILES) $(EXES) $(PROTO_GOS) .cache
 	go clean ./...
-
-# We currently commit the BUILD files because of a couple of corner cases with
-# gazelle - https://github.com/bazelbuild/rules_go/issues/422
-# and https://github.com/bazelbuild/rules_go/issues/423.  If you ever regenerate
-# the BUILD files, watch out for the rules in vendor/golang.org/x/crypto/curve25519
-update-gazelle: $(PROTOS_GO)
-	bazel run //:gazelle
-
-update-vendor:
-	dep ensure
-	git status | grep BUILD.bazel | cut -d' ' -f 5 | xargs git checkout HEAD
-
-bazel: $(PROTOS_GO)
-	bazel build //cmd/...
-
-bazel-test: $(PROTOS_GO)
-	bazel test //pkg/...
 
 save-images:
 	@mkdir -p images

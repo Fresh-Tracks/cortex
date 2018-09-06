@@ -2,24 +2,16 @@ package ingester
 
 import (
 	"fmt"
-	"net/http"
 	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/weaveworks/common/httpgrpc"
+
 	"github.com/weaveworks/cortex/pkg/prom1/storage/local/chunk"
 	"github.com/weaveworks/cortex/pkg/prom1/storage/metric"
 )
 
 var (
-	discardedSamples = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "cortex_ingester_out_of_order_samples_total",
-			Help: "The total number of samples that were discarded because their timestamps were at or before the last received sample for a series.",
-		},
-		[]string{discardReasonLabel},
-	)
 	createdChunks = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "cortex_ingester_chunks_created_total",
 		Help: "The total number of chunks the ingester has created.",
@@ -27,7 +19,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(discardedSamples)
+	prometheus.MustRegister(createdChunks)
 }
 
 type memorySeries struct {
@@ -45,6 +37,15 @@ type memorySeries struct {
 	lastSampleValueSet bool
 	lastTime           model.Time
 	lastSampleValue    model.SampleValue
+}
+
+type memorySeriesError struct {
+	message   string
+	errorType string
+}
+
+func (error *memorySeriesError) Error() string {
+	return error.message
 }
 
 // newMemorySeries returns a pointer to a newly allocated memorySeries for the
@@ -71,12 +72,16 @@ func (s *memorySeries) add(v model.SamplePair) error {
 		return nil
 	}
 	if v.Timestamp == s.lastTime {
-		discardedSamples.WithLabelValues(duplicateSample).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, "sample with repeated timestamp but different value for series %v; last value: %v, incoming value: %v", s.metric, s.lastSampleValue, v.Value)
+		return &memorySeriesError{
+			message:   fmt.Sprintf("sample with repeated timestamp but different value for series %v; last value: %v, incoming value: %v", s.metric, s.lastSampleValue, v.Value),
+			errorType: "new-value-for-timestamp",
+		}
 	}
 	if v.Timestamp < s.lastTime {
-		discardedSamples.WithLabelValues(outOfOrderTimestamp).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, "sample timestamp out of order for series %v; last timestamp: %v, incoming timestamp: %v", s.metric, s.lastTime, v.Timestamp) // Caused by the caller.
+		return &memorySeriesError{
+			message:   fmt.Sprintf("sample timestamp out of order for series %v; last timestamp: %v, incoming timestamp: %v", s.metric, s.lastTime, v.Timestamp),
+			errorType: "sample-out-of-order",
+		}
 	}
 
 	if len(s.chunkDescs) == 0 || s.headChunkClosed {

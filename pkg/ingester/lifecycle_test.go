@@ -2,6 +2,7 @@ package ingester
 
 import (
 	"io"
+	"math"
 	"reflect"
 	"runtime"
 	"testing"
@@ -17,34 +18,27 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 
 	"github.com/weaveworks/common/user"
+	"github.com/weaveworks/cortex/pkg/chunk"
 	"github.com/weaveworks/cortex/pkg/ingester/client"
 	"github.com/weaveworks/cortex/pkg/ring"
 	"github.com/weaveworks/cortex/pkg/util"
 )
 
-const (
-	userID    = "1"
-	aLongTime = 60 * time.Second
-)
+const userID = "1"
 
 func defaultIngesterTestConfig() Config {
 	consul := ring.NewInMemoryKVClient()
-	return Config{
-		LifecyclerConfig: ring.LifecyclerConfig{
-			KVClient: consul,
-
-			NumTokens:       1,
-			HeartbeatPeriod: 5 * time.Second,
-			ListenPort:      func(i int) *int { return &i }(0),
-
-			Addr: "localhost",
-			ID:   "localhost",
-		},
-
-		FlushCheckPeriod:  99999 * time.Hour,
-		MaxChunkIdle:      99999 * time.Hour,
-		ConcurrentFlushes: 1,
-	}
+	cfg := Config{}
+	util.DefaultValues(&cfg)
+	cfg.FlushCheckPeriod = 99999 * time.Hour
+	cfg.MaxChunkIdle = 99999 * time.Hour
+	cfg.ConcurrentFlushes = 1
+	cfg.LifecyclerConfig.KVClient = consul
+	cfg.LifecyclerConfig.NumTokens = 1
+	cfg.LifecyclerConfig.ListenPort = func(i int) *int { return &i }(0)
+	cfg.LifecyclerConfig.Addr = "localhost"
+	cfg.LifecyclerConfig.ID = "localhost"
+	return cfg
 }
 
 // TestIngesterRestart tests a restarting ingester doesn't keep adding more tokens.
@@ -78,14 +72,13 @@ func TestIngesterRestart(t *testing.T) {
 }
 
 func TestIngesterTransfer(t *testing.T) {
-	cfg := defaultIngesterTestConfig()
-
 	// Start the first ingester, and get it into ACTIVE state.
-	cfg1 := cfg
+	cfg1 := defaultIngesterTestConfig()
 	cfg1.LifecyclerConfig.ID = "ingester1"
 	cfg1.LifecyclerConfig.Addr = "ingester1"
 	cfg1.LifecyclerConfig.ClaimOnRollout = true
-	cfg1.SearchPendingFor = aLongTime
+	cfg1.LifecyclerConfig.JoinAfter = 0 * time.Second
+	cfg1.SearchPendingFor = 1 * time.Second
 	ing1, err := New(cfg1, nil)
 	require.NoError(t, err)
 
@@ -108,14 +101,15 @@ func TestIngesterTransfer(t *testing.T) {
 			Timestamp: ts,
 			Value:     val,
 		},
-	}))
+	}, client.API))
 	require.NoError(t, err)
 
 	// Start a second ingester, but let it go into PENDING
-	cfg2 := cfg
+	cfg2 := defaultIngesterTestConfig()
+	cfg2.LifecyclerConfig.KVClient = cfg1.LifecyclerConfig.KVClient
 	cfg2.LifecyclerConfig.ID = "ingester2"
 	cfg2.LifecyclerConfig.Addr = "ingester2"
-	cfg2.LifecyclerConfig.JoinAfter = aLongTime
+	cfg2.LifecyclerConfig.JoinAfter = 100 * time.Second
 	ing2, err := New(cfg2, nil)
 	require.NoError(t, err)
 
@@ -126,8 +120,11 @@ func TestIngesterTransfer(t *testing.T) {
 		}, nil
 	}
 
-	// Now stop the first ingester
+	// Now stop the first ingester, and wait for the second ingester to become ACTIVE.
 	ing1.Shutdown()
+	poll(t, 10*time.Second, ring.ACTIVE, func() interface{} {
+		return ing2.lifecycler.GetState()
+	})
 
 	// And check the second ingester has the sample
 	matcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "foo")
@@ -153,13 +150,38 @@ func TestIngesterTransfer(t *testing.T) {
 	}, response)
 }
 
+func TestIngesterBadTransfer(t *testing.T) {
+	// Start ingester in PENDING.
+	cfg := defaultIngesterTestConfig()
+	cfg.LifecyclerConfig.ID = "ingester1"
+	cfg.LifecyclerConfig.Addr = "ingester1"
+	cfg.LifecyclerConfig.ClaimOnRollout = true
+	cfg.LifecyclerConfig.JoinAfter = 100 * time.Second
+	cfg.SearchPendingFor = 1 * time.Second
+	ing, err := New(cfg, nil)
+	require.NoError(t, err)
+
+	poll(t, 100*time.Millisecond, ring.PENDING, func() interface{} {
+		return ing.lifecycler.GetState()
+	})
+
+	// Now transfer 0 series to this ingester, ensure it errors.
+	client := ingesterClientAdapater{ingester: ing}
+	stream, err := client.TransferChunks(context.Background())
+	require.NoError(t, err)
+	_, err = stream.CloseAndRecv()
+	require.Error(t, err)
+
+	// Check the ingester is still waiting.
+	require.Equal(t, ring.PENDING, ing.lifecycler.GetState())
+}
+
 func numTokens(c ring.KVClient, name string) int {
-	ringDesc, err := c.Get(ring.ConsulKey)
+	ringDesc, err := c.Get(context.Background(), ring.ConsulKey)
 	if err != nil {
 		level.Error(util.Logger).Log("msg", "error reading consul", "err", err)
 		return 0
 	}
-
 	count := 0
 	for _, token := range ringDesc.(*ring.Desc).Tokens {
 		if token.Ingester == name {
@@ -270,12 +292,8 @@ func (i ingesterClientAdapater) Close() error {
 // TestIngesterFlush tries to test that the ingester flushes chunks before
 // removing itself from the ring.
 func TestIngesterFlush(t *testing.T) {
-	cfg := defaultIngesterTestConfig()
-	store := newTestStore()
-
 	// Start the ingester, and get it into ACTIVE state.
-	ing, err := New(cfg, store)
-	require.NoError(t, err)
+	store, ing := newTestStore(t, defaultIngesterTestConfig())
 
 	poll(t, 100*time.Millisecond, ring.ACTIVE, func() interface{} {
 		return ing.lifecycler.GetState()
@@ -290,13 +308,13 @@ func TestIngesterFlush(t *testing.T) {
 		}
 	)
 	ctx := user.InjectOrgID(context.Background(), userID)
-	_, err = ing.Push(ctx, client.ToWriteRequest([]model.Sample{
+	_, err := ing.Push(ctx, client.ToWriteRequest([]model.Sample{
 		{
 			Metric:    m,
 			Timestamp: ts,
 			Value:     val,
 		},
-	}))
+	}, client.API))
 	require.NoError(t, err)
 
 	// We add a 100ms sleep into the flush loop, such that we can reliably detect
@@ -310,7 +328,7 @@ func TestIngesterFlush(t *testing.T) {
 	// the ring, the data is in the chunk store.
 	ing.lifecycler.Shutdown()
 	poll(t, 200*time.Millisecond, 0, func() interface{} {
-		r, err := ing.lifecycler.KVStore.Get(ring.ConsulKey)
+		r, err := ing.lifecycler.KVStore.Get(context.Background(), ring.ConsulKey)
 		if err != nil {
 			return -1
 		}
@@ -318,7 +336,7 @@ func TestIngesterFlush(t *testing.T) {
 	})
 
 	// And check the store has the chunk
-	res, err := chunksToMatrix(store.chunks[userID])
+	res, err := chunk.ChunksToMatrix(context.Background(), store.chunks[userID], model.Time(0), model.Time(math.MaxInt64))
 	require.NoError(t, err)
 	assert.Equal(t, model.Matrix{
 		&model.SampleStream{

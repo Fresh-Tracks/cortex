@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/encoding/gzip" // get gzip compressor registered
 
@@ -27,13 +26,24 @@ func main() {
 			GRPCMiddleware: []grpc.UnaryServerInterceptor{
 				middleware.ServerUserHeaderInterceptor,
 			},
+			GRPCStreamMiddleware: []grpc.StreamServerInterceptor{
+				func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+					// Don't check auth header on TransferChunks, as we weren't originally
+					// sending it and this could cause transfers to fail on update.
+					if info.FullMethod == "/cortex.Ingester/TransferChunks" {
+						return handler(srv, ss)
+					}
+
+					return middleware.StreamServerUserHeaderInterceptor(srv, ss, info, handler)
+				},
+			},
 			ExcludeRequestInLog: true,
 		}
 		chunkStoreConfig chunk.StoreConfig
 		schemaConfig     chunk.SchemaConfig
 		storageConfig    storage.Config
 		ingesterConfig   ingester.Config
-		logLevel         util.LogLevel
+		preallocConfig   client.PreallocConfig
 		eventSampleRate  int
 		maxStreams       uint
 	)
@@ -45,12 +55,12 @@ func main() {
 	// Ingester needs to know our gRPC listen port.
 	ingesterConfig.LifecyclerConfig.ListenPort = &serverConfig.GRPCListenPort
 	util.RegisterFlags(&serverConfig, &chunkStoreConfig, &storageConfig,
-		&schemaConfig, &ingesterConfig, &logLevel)
+		&schemaConfig, &ingesterConfig, &preallocConfig)
 	flag.UintVar(&maxStreams, "ingester.max-concurrent-streams", 1000, "Limit on the number of concurrent streams for gRPC calls (0 = unlimited)")
 	flag.IntVar(&eventSampleRate, "event.sample-rate", 0, "How often to sample observability events (0 = never).")
 	flag.Parse()
 
-	util.InitLogger(logLevel.AllowedLevel)
+	util.InitLogger(&serverConfig)
 	util.InitEvents(eventSampleRate)
 
 	if maxStreams > 0 {
@@ -64,13 +74,13 @@ func main() {
 	}
 	defer server.Shutdown()
 
-	storageClient, err := storage.NewStorageClient(storageConfig, schemaConfig)
+	storageOpts, err := storage.Opts(storageConfig, schemaConfig)
 	if err != nil {
 		level.Error(util.Logger).Log("msg", "error initializing storage client", "err", err)
 		os.Exit(1)
 	}
 
-	chunkStore, err := chunk.NewStore(chunkStoreConfig, schemaConfig, storageClient)
+	chunkStore, err := chunk.NewStore(chunkStoreConfig, schemaConfig, storageOpts)
 	if err != nil {
 		level.Error(util.Logger).Log("err", err)
 		os.Exit(1)
@@ -82,7 +92,6 @@ func main() {
 		level.Error(util.Logger).Log("err", err)
 		os.Exit(1)
 	}
-	prometheus.MustRegister(ingester)
 	defer ingester.Shutdown()
 
 	client.RegisterIngesterServer(server.GRPC, ingester)
