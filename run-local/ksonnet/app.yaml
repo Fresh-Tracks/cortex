@@ -9,6 +9,12 @@ environments:
 kind: ksonnet.io/app
 name: cortex-lite
 registries:
+  helm-incubator:
+    protocol: helm
+    uri: https://kubernetes-charts-incubator.storage.googleapis.com/
+  helm-stable:
+    protocol: helm
+    uri: https://kubernetes-charts.storage.googleapis.com
   incubator:
     protocol: github
     uri: github.com/ksonnet/parts/tree/master/incubator
