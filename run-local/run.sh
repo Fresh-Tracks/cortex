@@ -42,10 +42,6 @@ fi
 
 echo "Found cortex-lite image in minikube docker: ${CORTEX_LITE_IMG}. Continuing..."
 
-echo "Starting Google Cloud Bigtable emulator..."
-nohup ${GC} beta emulators bigtable start > bigtable-emulator.log &
-echo "To stop emulator (assuming delete.sh doesn't do it), run: pkill -9 -f bigtable-emulator"
-
 echo "Applying ksonnet bits to ${KS_ENV} environment..."
 pushd ksonnet > /dev/null
 kubectl config use-context ${KS_ENV}
