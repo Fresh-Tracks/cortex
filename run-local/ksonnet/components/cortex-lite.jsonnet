@@ -19,9 +19,6 @@ local appService = service.new(
   servicePort.new(params.servicePort, targetPort)
 ).withType(params.type);
 
-local GCPKey =
-  secret.new('gcp-key', { 'gcp.json': std.base64(std.manifestJsonEx(params.gcp_key, '  ')) });
-
 local appDeployment =
   deployment.new(
     params.name,
@@ -29,24 +26,9 @@ local appDeployment =
     container.new(params.name, params.image)
     .withArgs(args + params.cortex_flags)
     .withPorts(containerPort.new(targetPort))
-    .withImagePullPolicy('Never')
-    .withVolumeMounts([{
-      name: 'gcp-creds',
-      mountPath: '/secret',
-      readOnly: true,
-    }])
-    .withEnv([{
-      name: 'GOOGLE_APPLICATION_CREDENTIALS',
-      value: '/secret/gcp.json',
-    }]),
+    .withImagePullPolicy('Never'),
     labels
   )
-  + deployment.mixin.spec.template.spec.withVolumes([{
-    name: 'gcp-creds',
-    secret: {
-      secretName: 'gcp-key',
-    },
-  }])
   + deployment.mixin.spec.template.spec.withTerminationGracePeriodSeconds(10);
 
-k.core.v1.list.new([GCPKey, appService, appDeployment])
+k.core.v1.list.new([appService, appDeployment])

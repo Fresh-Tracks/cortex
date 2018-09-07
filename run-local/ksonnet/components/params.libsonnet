@@ -13,6 +13,7 @@
         '-server.http-read-timeout': '31s',
         '-distributor.replication-factor': 1,
         '-database.uri': 'memory://',
+        '-chunk.storage-client': 'inmemory',
       },
       cortex_flags: [
         '-dynamodb.use-periodic-tables',
@@ -135,11 +136,6 @@
           }
         }
       |||,
-    },
-    cassandra: {
-      name: "cassandra",
-      values: {},
-      version: "0.5.3",
     },
   },
 }
