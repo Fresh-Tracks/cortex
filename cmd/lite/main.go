@@ -30,6 +30,16 @@ import (
 	"github.com/weaveworks/cortex/pkg/util"
 )
 
+// parseFlags into each of the Registerers, each as an isolated FlagSet
+// to avoid duplicate names and `flag redefined` panics
+func parseFlags(args []string, rs ...util.Registerer) {
+	for _, r := range rs {
+		fs := flag.NewFlagSet("component", flag.ContinueOnError)
+		r.RegisterFlags(fs)
+		fs.Parse(args)
+	}
+}
+
 func main() {
 	var (
 		serverConfig = server.Config{
@@ -52,7 +62,8 @@ func main() {
 	)
 	// Ingester needs to know our gRPC listen port.
 	ingesterConfig.LifecyclerConfig.ListenPort = &serverConfig.GRPCListenPort
-	util.RegisterFlags(&serverConfig, &chunkStoreConfig, &distributorConfig, &querierConfig,
+
+	parseFlags(os.Args[1:], &serverConfig, &chunkStoreConfig, &distributorConfig, &querierConfig,
 		&ingesterConfig, &configStoreConfig, &rulerConfig, &storageConfig, &schemaConfig)
 	flag.BoolVar(&unauthenticated, "unauthenticated", false, "Set to true to disable multitenancy.")
 	flag.Parse()
