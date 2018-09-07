@@ -136,5 +136,10 @@
         }
       |||,
     },
+    cassandra: {
+      name: "cassandra",
+      values: {},
+      version: "0.5.3",
+    },
   },
 }

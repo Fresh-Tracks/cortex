@@ -7,6 +7,11 @@ environments:
     k8sVersion: v1.10.0
     path: cortex_lite
 kind: ksonnet.io/app
+libraries:
+  cassandra:
+    name: cassandra
+    registry: helm-incubator
+    version: ""
 name: cortex-lite
 registries:
   helm-incubator:
