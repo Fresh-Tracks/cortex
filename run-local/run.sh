@@ -43,7 +43,7 @@ fi
 echo "Found cortex-lite image in minikube docker: ${CORTEX_LITE_IMG}. Continuing..."
 
 echo "Applying ksonnet bits to ${KS_ENV} environment..."
-pushd ksonnet > /dev/null
+pushd ${SCRIPT_DIR}/ksonnet > /dev/null
 kubectl config use-context ${KS_ENV}
 ${KS} apply --insecure-skip-tls-verify ${KS_ENV}
 popd > /dev/null
