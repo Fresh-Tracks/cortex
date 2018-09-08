@@ -63,11 +63,11 @@ func main() {
 	// Ingester needs to know our gRPC listen port.
 	ingesterConfig.LifecyclerConfig.ListenPort = &serverConfig.GRPCListenPort
 
-	parseFlags(os.Args[1:], &serverConfig, &chunkStoreConfig, &distributorConfig, &querierConfig,
+	util.RegisterFlags(&serverConfig, &chunkStoreConfig, &distributorConfig, &querierConfig,
 		&ingesterConfig, &configStoreConfig, &rulerConfig, &storageConfig, &schemaConfig)
 	flag.BoolVar(&unauthenticated, "unauthenticated", false, "Set to true to disable multitenancy.")
 	flag.Parse()
-	ingesterConfig.SetClientConfig(distributorConfig.IngesterClientConfig)
+	ingesterConfig.SetClientConfig(distributorConfig.IngesterClientConfig, distributorConfig.Limits)
 
 	// Setting the environment variable JAEGER_AGENT_HOST enables tracing
 	trace := tracing.NewFromEnv("ingester")

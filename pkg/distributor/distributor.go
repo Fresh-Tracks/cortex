@@ -102,7 +102,7 @@ type Config struct {
 	BillingConfig        billing.Config
 	IngesterClientConfig ingester_client.Config
 	PoolConfig           ingester_client.PoolConfig
-	limits               validation.Limits
+	Limits               validation.Limits
 
 	RemoteTimeout time.Duration
 
@@ -117,7 +117,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.BillingConfig.RegisterFlags(f)
 	cfg.IngesterClientConfig.RegisterFlags(f)
 	cfg.PoolConfig.RegisterFlags(f)
-	cfg.limits.RegisterFlags(f)
+	cfg.Limits.RegisterFlags(f)
 
 	f.BoolVar(&cfg.EnableBilling, "distributor.enable-billing", false, "Report number of ingested samples to billing system.")
 	f.DurationVar(&cfg.RemoteTimeout, "distributor.remote-timeout", 2*time.Second, "Timeout for downstream ingesters.")
@@ -141,7 +141,7 @@ func New(cfg Config, ring ring.ReadRing) (*Distributor, error) {
 		}
 	}
 
-	limits, err := validation.NewOverrides(cfg.limits)
+	limits, err := validation.NewOverrides(cfg.Limits)
 	if err != nil {
 		return nil, err
 	}
