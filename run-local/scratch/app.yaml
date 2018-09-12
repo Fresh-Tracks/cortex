@@ -1,0 +1,23 @@
+apiVersion: 0.2.0
+environments:
+  default:
+    destination:
+      namespace: default
+      server: https://192.168.99.100:8443
+    k8sVersion: v1.10.0
+    path: default
+kind: ksonnet.io/app
+libraries:
+  cortex:
+    name: cortex
+    registry: cortex
+    version: ""
+name: scratch
+registries:
+  cortex:
+    protocol: fs
+    uri: ../../ksonnet
+  incubator:
+    protocol: github
+    uri: github.com/ksonnet/parts/tree/master/incubator
+version: 0.0.1

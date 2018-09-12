@@ -1,14 +1,5 @@
-// @apiVersion 0.0.2
-// @name cortex.pkg.cortex-component
-// @description Deploys a <cortex-component> into your K8s environment
-// @shortDescription Cortex cluster deployment
-// @param name string Name to give to each of the components
-// @optionalParam imageBase string quay.io/weaveworks/cortex- Base of the image URI
-// @param cortexComponent string The piece of Cortex for which you are generating a ksonnet component - appended to imageBase
-// @optionalParam imageTag string latest Tag of the image to be used, such as '4728ec9' or 'latest' - appended to cortexComponent
-// @optionalParam replicas number 1 Number of replicas to use
-// @optionalParam restPort number 8080 Port to run the rest api on
-// @optionalParam system string cortex System label to apply to each component
+local env = std.extVar("__ksonnet/environments");
+local params = std.extVar("__ksonnet/params").components.glab;
 
 local cortex = import 'cortex/cortex/cortex.libsonnet';
 local util = import 'cortex/cortex/util.libsonnet';
