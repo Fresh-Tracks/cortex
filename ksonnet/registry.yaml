@@ -2,4 +2,4 @@ apiVersion: '0.1'
 kind: ksonnet.io/registry
 libraries:
   cortex:
-    path: cortex-pkg
+    path: cortex
