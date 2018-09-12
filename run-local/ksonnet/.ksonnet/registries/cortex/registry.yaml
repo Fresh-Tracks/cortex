@@ -1,0 +1,7 @@
+apiVersion: 0.2.0
+kind: ksonnet.io/registry
+libraries:
+  cortex:
+    path: cortex
+    version: f30ab983dd3a8c6f804e96e9c0d6f163843d0ac2
+version: f30ab983dd3a8c6f804e96e9c0d6f163843d0ac2

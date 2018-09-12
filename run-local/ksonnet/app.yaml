@@ -20,7 +20,7 @@ name: cortex-lite
 registries:
   cortex:
     protocol: fs
-    uri: /Users/bogco01/projects/go/src/github.com/weaveworks/cortex/run-local/ksonnet/../../ksonnet
+    uri: ../../ksonnet
   helm-incubator:
     protocol: helm
     uri: https://kubernetes-charts-incubator.storage.googleapis.com/
