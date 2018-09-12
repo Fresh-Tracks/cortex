@@ -12,8 +12,15 @@ libraries:
     name: cassandra
     registry: helm-incubator
     version: ""
+  cortex:
+    name: cortex
+    registry: cortex
+    version: ""
 name: cortex-lite
 registries:
+  cortex:
+    protocol: fs
+    uri: /Users/bogco01/projects/go/src/github.com/weaveworks/cortex/run-local/ksonnet/../../ksonnet
   helm-incubator:
     protocol: helm
     uri: https://kubernetes-charts-incubator.storage.googleapis.com/

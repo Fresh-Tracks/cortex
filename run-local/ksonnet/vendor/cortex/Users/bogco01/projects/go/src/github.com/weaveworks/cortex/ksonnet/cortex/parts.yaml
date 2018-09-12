@@ -1,0 +1,8 @@
+name: cortex
+apiVersion: 0.0.1
+kind: ksonnet.io/parts
+description: Cortex is a distributed API-compatible implemention of Prometheus with long-term storage, HA, multitenancy, and horizontal scalability.
+author: Cortex Team
+contributors:
+  - name: Cody Boggs
+    email: strofcon@gmail.com
