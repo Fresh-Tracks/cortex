@@ -28,12 +28,17 @@ type mockItem struct {
 	value      []byte
 }
 
+var storage *MockStorage
+
 // NewMockStorage creates a new MockStorage.
 func NewMockStorage() *MockStorage {
-	return &MockStorage{
-		tables:  map[string]*mockTable{},
-		objects: map[string][]byte{},
+	if storage == nil {
+		storage = &MockStorage{
+			tables:  map[string]*mockTable{},
+			objects: map[string][]byte{},
+		}
 	}
+	return storage
 }
 
 // ListTables implements StorageClient.
